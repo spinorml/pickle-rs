@@ -1,0 +1,19 @@
+[package]
+name = "pickle-rs"
+version = "0.1.0"
+authors = ["Arshad M <arshadm@spinorml.com>"]
+license = "Apache-2.0"
+description = "A de-serialization library for Python's pickle format"
+repository = "https://github.com/spinorml/pickle-rs"
+documentation = "http://docs.rs/pickle-rs"
+keywords = ["pickle", "python", "serialization"]
+edition = "2021"
+
+[dependencies]
+byteorder = "1.5.0"
+num-bigint = "0.4.4"
+
+[dev-dependencies]
+rand = "0.8.5"
+quickcheck = "1.0.3"
+criterion = "0.5.1"
