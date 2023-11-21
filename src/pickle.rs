@@ -23,17 +23,6 @@ use std::io::Read;
 use crate::error::Result;
 use crate::value::Value;
 
-// # These are purely informational; no code uses these.
-const FORMAT_VERSION: &str = "4.0"; // File format version we write
-
-// This is the highest protocol number we know how to read.
-const HIGHEST_PROTOCOL: u32 = 5;
-
-// The protocol we write by default.  May be less than HIGHEST_PROTOCOL.
-// Only bump this if the oldest still supported version of Python already
-// includes it.
-const DEFAULT_PROTOCOL: u32 = 4;
-
 const MARK: u8 = b'('; // push special markobject on stack
 const STOP: u8 = b'.'; // every pickle ends with STOP
 const POP: u8 = b'0'; // discard topmost stack item
@@ -141,12 +130,374 @@ impl Unpickler {
         Self { options }
     }
 
-    pub fn load(&self, _file: impl Read) -> Result<Value> {
-        todo!("Unpickler::load")
+    pub fn load(&self, mut file: impl Read) -> Result<Value> {
+        let mut buf: [u8; 1] = [0; 1];
+        let count = file.read(&mut buf)?;
+        debug_assert_eq!(count, 1);
+
+        self.load_op(buf[0])
     }
 
     pub fn load_from_slice(&self, _file: &[u8]) -> Result<Value> {
-        todo!("Unpickler::load")
+        todo!("Unpickler::load_from_slice")
+    }
+
+    fn load_op(&self, op: u8) -> Result<Value> {
+        match op {
+            MARK => self.load_mark(),
+            STOP => self.load_stop(),
+            POP => self.load_pop(),
+            POP_MARK => self.load_pop_mark(),
+            DUP => self.load_dup(),
+            FLOAT => self.load_float(),
+            INT => self.load_int(),
+            BININT => self.load_binint(),
+            BININT1 => self.load_binint1(),
+            LONG => self.load_long(),
+            BININT2 => self.load_binint2(),
+            NONE => self.load_none(),
+            PERSID => self.load_persid(),
+            BINPERSID => self.load_binpersid(),
+            REDUCE => self.load_reduce(),
+            STRING => self.load_string(),
+            BINSTRING => self.load_binstring(),
+            SHORT_BINSTRING => self.load_short_binstring(),
+            UNICODE => self.load_unicode(),
+            BINUNICODE => self.load_binunicode(),
+            APPEND => self.load_append(),
+            BUILD => self.load_build(),
+            GLOBAL => self.load_global(),
+            DICT => self.load_dict(),
+            EMPTY_DICT => self.load_empty_dict(),
+            APPENDS => self.load_appends(),
+            GET => self.load_get(),
+            BINGET => self.load_binget(),
+            INST => self.load_inst(),
+            LONG_BINGET => self.load_long_binget(),
+            LIST => self.load_list(),
+            EMPTY_LIST => self.load_empty_list(),
+            OBJ => self.load_obj(),
+            PUT => self.load_put(),
+            BINPUT => self.load_binput(),
+            LONG_BINPUT => self.load_long_binput(),
+            SETITEM => self.load_setitem(),
+            TUPLE => self.load_tuple(),
+            EMPTY_TUPLE => self.load_empty_tuple(),
+            SETITEMS => self.load_setitems(),
+            BINFLOAT => self.load_binfloat(),
+            TRUE => self.load_true(),
+            FALSE => self.load_false(),
+            PROTO => self.load_proto(),
+            NEWOBJ => self.load_newobj(),
+            EXT1 => self.load_ext1(),
+            EXT2 => self.load_ext2(),
+            EXT4 => self.load_ext4(),
+            TUPLE1 => self.load_tuple1(),
+            TUPLE2 => self.load_tuple2(),
+            TUPLE3 => self.load_tuple3(),
+            NEWTRUE => self.load_newtrue(),
+            NEWFALSE => self.load_newfalse(),
+            LONG1 => self.load_long1(),
+            LONG4 => self.load_long4(),
+            BINBYTES => self.load_binbytes(),
+            SHORT_BINBYTES => self.load_short_binbytes(),
+            SHORT_BINUNICODE => self.load_short_binunicode(),
+            BINUNICODE8 => self.load_binunicode8(),
+            BINBYTES8 => self.load_binbytes8(),
+            EMPTY_SET => self.load_empty_set(),
+            ADDITEMS => self.load_additems(),
+            FROZENSET => self.load_frozenset(),
+            NEWOBJ_EX => self.load_newobj_ex(),
+            STACK_GLOBAL => self.load_stack_global(),
+            MEMOIZE => self.load_memoize(),
+            FRAME => self.load_frame(),
+            BYTEARRAY8 => self.load_bytearray8(),
+            NEXT_BUFFER => self.load_next_buffer(),
+            READONLY_BUFFER => self.load_readonly_buffer(),
+            _ => unimplemented!("Unpickler::load_op"),
+        }
+
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_mark(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_stop(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_pop(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_pop_mark(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_dup(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_float(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_int(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_binint(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_binint1(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_long(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_binint2(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_none(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_persid(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_binpersid(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_reduce(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_string(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_binstring(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_short_binstring(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_unicode(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_binunicode(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_append(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_build(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_global(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_dict(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_empty_dict(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_appends(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_get(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_binget(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_inst(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_long_binget(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_list(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_empty_list(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_obj(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_put(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_binput(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_long_binput(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_setitem(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_tuple(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_empty_tuple(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_setitems(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_binfloat(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_true(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_false(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_proto(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_newobj(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_ext1(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_ext2(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_ext4(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_tuple1(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_tuple2(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_tuple3(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_newtrue(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_newfalse(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_long1(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_long4(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_binbytes(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_short_binbytes(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_short_binunicode(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_binunicode8(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_binbytes8(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_empty_set(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_additems(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_frozenset(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_newobj_ex(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_stack_global(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_memoize(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_frame(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_bytearray8(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_next_buffer(&self) {
+        todo!("Unpickler::load_op")
+    }
+
+    fn load_readonly_buffer(&self) {
+        todo!("Unpickler::load_op")
     }
 }
 
