@@ -19,40 +19,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::fs::File;
+use std::{fs::File, io::BufReader};
 
 use num_bigint::BigInt;
-use pickle_rs::{Error, ErrorCode, HashableValue, Unpickler, UnpicklerOptions, Value};
+use pickle_rs::{Error, ErrorCode, Unpickler, UnpicklerOptions, Value};
 
 macro_rules! pyobj {
     (n=None)     => { Value::None };
     (b=True)     => { Value::Bool(true) };
     (b=False)    => { Value::Bool(false) };
     (i=$i:expr)  => { Value::I64($i) };
-    (ii=$i:expr) => { Value::Int($i.clone()) };
+    (ii=$i:expr) => { Value::Int($i) };
     (f=$f:expr)  => { Value::F64($f) };
     (bb=$b:expr) => { Value::Bytes($b.to_vec()) };
     (s=$s:expr)  => { Value::String($s.into()) };
     (t=($($m:ident=$v:tt),*))  => { Value::Tuple(vec![$(pyobj!($m=$v)),*]) };
     (l=[$($m:ident=$v:tt),*])  => { Value::List(vec![$(pyobj!($m=$v)),*]) };
-    (ss=($($m:ident=$v:tt),*)) => { Value::Set(vec![$(hpyobj!($m=$v)),*]) };
-    (fs=($($m:ident=$v:tt),*)) => { Value::FrozenSet(vec![$(hpyobj!($m=$v)),*]) };
+    (ss=($($m:ident=$v:tt),*)) => { Value::Set(vec![$(pyobj!($m=$v)),*]) };
+    (fs=($($m:ident=$v:tt),*)) => { Value::FrozenSet(vec![$(pyobj!($m=$v)),*]) };
     (d={$($km:ident=$kv:tt => $vm:ident=$vv:tt),*}) => {
-        Value::Dict(vec![$((hpyobj!($km=$kv), pyobj!($vm=$vv))),*])
+        Value::Dict(vec![$((pyobj!($km=$kv), pyobj!($vm=$vv))),*])
     };
-}
-
-macro_rules! hpyobj {
-    (n=None)     => { HashableValue::None };
-    (b=True)     => { HashableValue::Bool(true) };
-    (b=False)    => { HashableValue::Bool(false) };
-    (i=$i:expr)  => { HashableValue::I64($i) };
-    (ii=$i:expr) => { HashableValue::Int($i.clone()) };
-    (f=$f:expr)  => { HashableValue::F64($f) };
-    (bb=$b:expr) => { HashableValue::Bytes($b.to_vec()) };
-    (s=$s:expr)  => { HashableValue::String($s.into()) };
-    (t=($($m:ident=$v:tt),*))  => { HashableValue::Tuple(vec![$(hpyobj!($m=$v)),*]) };
-    (fs=($($m:ident=$v:tt),*)) => { HashableValue::FrozenSet(vec![$(hpyobj!($m=$v)),*]) };
 }
 
 // combinations of (python major, pickle proto) to test
@@ -69,7 +56,7 @@ const TEST_CASES: &[(u32, u32)] = &[
 ];
 
 fn get_test_object(pyver: u32) -> Value {
-    let longish = BigInt::from(10000000000u64) * BigInt::from(10000000000u64);
+    let longish = 1000000 * 1000;
     let mut obj = pyobj!(d={
         n=None           => n=None,
         b=False          => t=(b=False, b=True),
@@ -92,9 +79,9 @@ fn get_test_object(pyver: u32) -> Value {
     match &mut obj {
         Value::Dict(map) => {
             if pyver == 2 {
-                map.push((hpyobj!(i = 7), pyobj!(d={bb=b"attr" => i=5})));
+                map.push((pyobj!(i = 7), pyobj!(d={bb=b"attr" => i=5})));
             } else {
-                map.push((hpyobj!(i = 7), pyobj!(d={s="attr" => i=5})));
+                map.push((pyobj!(i = 7), pyobj!(d={s="attr" => i=5})));
             }
         }
         _ => unreachable!(),
@@ -106,8 +93,10 @@ fn get_test_object(pyver: u32) -> Value {
 fn unpickle_all() {
     for &(major, proto) in TEST_CASES {
         let filename = format!("tests/data/tests_py{}_proto{}.pickle", major, proto);
-        let file = File::open(filename).unwrap();
-        let unpickler = Unpickler::new(UnpicklerOptions::default());
+        println!("Filename: {}", filename);
+
+        let file = BufReader::new(File::open(filename).unwrap());
+        let mut unpickler = Unpickler::new(UnpicklerOptions::default());
 
         let comparison = get_test_object(major);
         let unpickled = unpickler.load(file).unwrap();
@@ -119,8 +108,8 @@ fn unpickle_all() {
 fn recursive() {
     for proto in &[0, 1, 2, 3, 4, 5] {
         let filename = format!("tests/data/test_recursive_proto{}.pickle", proto);
-        let file = File::open(filename).unwrap();
-        let unpickler = Unpickler::new(UnpicklerOptions::default());
+        let file = BufReader::new(File::open(filename).unwrap());
+        let mut unpickler = Unpickler::new(UnpicklerOptions::default());
 
         match unpickler.load(file) {
             Err(Error::Syntax(ErrorCode::Recursive)) => {}

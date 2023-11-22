@@ -20,6 +20,8 @@
 
 use std::fmt;
 use std::io;
+use std::num::ParseFloatError;
+use std::num::ParseIntError;
 use std::result;
 
 #[derive(Clone, PartialEq, Debug)]
@@ -102,6 +104,18 @@ pub enum Error {
 impl From<io::Error> for Error {
     fn from(error: io::Error) -> Error {
         Error::Io(error)
+    }
+}
+
+impl From<ParseIntError> for Error {
+    fn from(err: ParseIntError) -> Error {
+        Error::Syntax(ErrorCode::InvalidValue(err.to_string()))
+    }
+}
+
+impl From<ParseFloatError> for Error {
+    fn from(err: ParseFloatError) -> Error {
+        Error::Syntax(ErrorCode::InvalidValue(err.to_string()))
     }
 }
 

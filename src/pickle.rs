@@ -18,10 +18,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::io::Read;
+use std::collections::HashMap;
+use std::io::BufRead;
+
+use byteorder::{BigEndian, ByteOrder, LittleEndian};
 
 use crate::error::Result;
 use crate::value::Value;
+use crate::{Error, ErrorCode};
 
 const MARK: u8 = b'('; // push special markobject on stack
 const STOP: u8 = b'.'; // every pickle ends with STOP
@@ -64,8 +68,6 @@ const TUPLE: u8 = b't'; // build tuple from topmost stack items
 const EMPTY_TUPLE: u8 = b')'; // push empty tuple
 const SETITEMS: u8 = b'u'; // modify dict by adding topmost key+value pairs
 const BINFLOAT: u8 = b'G'; // push float; arg is 8-byte float encoding
-const TRUE: u8 = 1; // not an opcode; see INT docs in pickletools.py
-const FALSE: u8 = 0; // not an opcode; see INT docs in pickletools.py
 
 // # Protocol 2
 const PROTO: u8 = b'\x80'; // identify pickle protocol
@@ -105,6 +107,9 @@ const BYTEARRAY8: u8 = b'\x96'; // push bytearray
 const NEXT_BUFFER: u8 = b'\x97'; // push next out-of-band buffer
 const READONLY_BUFFER: u8 = b'\x98'; // make top of stack readonly
 
+const TRUE: &[u8; 4] = b"I01\n"; // not an opcode; see INT docs in pickletools.py
+const FALSE: &[u8; 4] = b"I00\n"; // not an opcode; see INT docs in pickletools.py
+
 pub struct UnpicklerOptions {
     fix_imports: bool,
     encoding: String,
@@ -123,37 +128,61 @@ impl Default for UnpicklerOptions {
 
 pub struct Unpickler {
     options: UnpicklerOptions,
+    metastack: Vec<Vec<Value>>,
+    stack: Vec<Value>,
+    memo: HashMap<u32, Value>,
 }
 
 impl Unpickler {
     pub fn new(options: UnpicklerOptions) -> Self {
-        Self { options }
+        Self {
+            options,
+            metastack: Vec::new(),
+            stack: Vec::new(),
+            memo: HashMap::new(),
+        }
     }
 
-    pub fn load(&self, mut file: impl Read) -> Result<Value> {
-        let mut buf: [u8; 1] = [0; 1];
-        let count = file.read(&mut buf)?;
-        debug_assert_eq!(count, 1);
+    pub fn load(&mut self, mut file: impl BufRead) -> Result<Value> {
+        let mut buf = [0; 1];
+        let result;
 
-        self.load_op(buf[0])
+        loop {
+            file.read_exact(&mut buf)?;
+
+            let op = buf[0];
+            match op {
+                STOP => {
+                    result = self.load_stop();
+                    break;
+                }
+                _ => {
+                    self.load_op(op, &mut file)?;
+                }
+            }
+        }
+
+        match result {
+            Some(result) => Ok(result),
+            None => Err(Error::Syntax(ErrorCode::EOFWhileParsing)),
+        }
     }
 
     pub fn load_from_slice(&self, _file: &[u8]) -> Result<Value> {
         todo!("Unpickler::load_from_slice")
     }
 
-    fn load_op(&self, op: u8) -> Result<Value> {
+    fn load_op(&mut self, op: u8, mut file: impl BufRead) -> Result<()> {
         match op {
             MARK => self.load_mark(),
-            STOP => self.load_stop(),
             POP => self.load_pop(),
             POP_MARK => self.load_pop_mark(),
             DUP => self.load_dup(),
-            FLOAT => self.load_float(),
-            INT => self.load_int(),
+            FLOAT => self.load_float(&mut file),
+            INT => self.load_int(&mut file),
             BININT => self.load_binint(),
             BININT1 => self.load_binint1(),
-            LONG => self.load_long(),
+            LONG => self.load_long(&mut file),
             BININT2 => self.load_binint2(),
             NONE => self.load_none(),
             PERSID => self.load_persid(),
@@ -177,7 +206,7 @@ impl Unpickler {
             LIST => self.load_list(),
             EMPTY_LIST => self.load_empty_list(),
             OBJ => self.load_obj(),
-            PUT => self.load_put(),
+            PUT => self.load_put(&mut file),
             BINPUT => self.load_binput(),
             LONG_BINPUT => self.load_long_binput(),
             SETITEM => self.load_setitem(),
@@ -185,8 +214,6 @@ impl Unpickler {
             EMPTY_TUPLE => self.load_empty_tuple(),
             SETITEMS => self.load_setitems(),
             BINFLOAT => self.load_binfloat(),
-            TRUE => self.load_true(),
-            FALSE => self.load_false(),
             PROTO => self.load_proto(),
             NEWOBJ => self.load_newobj(),
             EXT1 => self.load_ext1(),
@@ -214,290 +241,344 @@ impl Unpickler {
             BYTEARRAY8 => self.load_bytearray8(),
             NEXT_BUFFER => self.load_next_buffer(),
             READONLY_BUFFER => self.load_readonly_buffer(),
-            _ => unimplemented!("Unpickler::load_op"),
+            _ => unreachable!("Unspported op: {}", op as i32),
+        }
+    }
+
+    fn load_mark(&mut self) -> Result<()> {
+        self.metastack.push(self.stack.clone());
+        self.stack.clear();
+        Ok(())
+    }
+
+    fn load_stop(&mut self) -> Option<Value> {
+        self.stack.pop()
+    }
+
+    fn load_pop(&self) -> Result<()> {
+        todo!("Unpickler::load_pop")
+    }
+
+    fn load_pop_mark(&self) -> Result<()> {
+        todo!("Unpickler::load_pop_mark")
+    }
+
+    fn load_dup(&self) -> Result<()> {
+        todo!("Unpickler::load_dup")
+    }
+
+    fn load_float(&mut self, mut file: impl BufRead) -> Result<()> {
+        let mut buf = String::new();
+        file.read_line(&mut buf)?;
+        let f = buf.trim().parse::<f64>()?;
+        self.stack.push(Value::F64(f));
+        Ok(())
+    }
+
+    fn load_int(&mut self, mut file: impl BufRead) -> Result<()> {
+        let mut buf = String::new();
+        file.read_line(&mut buf)?;
+
+        if buf.as_bytes() == TRUE {
+            self.stack.push(Value::Bool(true));
+        } else if buf.as_bytes() == FALSE {
+            self.stack.push(Value::Bool(false));
+        } else {
+            let i = buf.trim().parse::<i32>()?;
+            self.stack.push(Value::Int(i));
         }
 
-        todo!("Unpickler::load_op")
+        Ok(())
     }
 
-    fn load_mark(&self) {
-        todo!("Unpickler::load_op")
+    fn load_binint(&self) -> Result<()> {
+        todo!("Unpickler::load_binint")
     }
 
-    fn load_stop(&self) {
-        todo!("Unpickler::load_op")
+    fn load_binint1(&self) -> Result<()> {
+        todo!("Unpickler::load_binint1")
     }
 
-    fn load_pop(&self) {
-        todo!("Unpickler::load_op")
-    }
-
-    fn load_pop_mark(&self) {
-        todo!("Unpickler::load_op")
-    }
-
-    fn load_dup(&self) {
-        todo!("Unpickler::load_op")
-    }
-
-    fn load_float(&self) {
-        todo!("Unpickler::load_op")
-    }
+    fn load_long(&mut self, mut file: impl BufRead) -> Result<()> {
+        let mut buf = String::new();
+        file.read_line(&mut buf)?;
 
-    fn load_int(&self) {
-        todo!("Unpickler::load_op")
+        let buf = buf.trim().trim_end_matches('L');
+        println!("I64 buf: {}", buf);
+        let value = buf.parse::<i128>()?;
+        self.stack.push(Value::I128(value));
+        Ok(())
     }
 
-    fn load_binint(&self) {
-        todo!("Unpickler::load_op")
+    fn load_binint2(&self) -> Result<()> {
+        todo!("Unpickler::load_binint2")
     }
 
-    fn load_binint1(&self) {
-        todo!("Unpickler::load_op")
+    fn load_none(&self) -> Result<()> {
+        todo!("Unpickler::load_none")
     }
 
-    fn load_long(&self) {
-        todo!("Unpickler::load_op")
+    fn load_persid(&self) -> Result<()> {
+        todo!("Unpickler::load_persid")
     }
 
-    fn load_binint2(&self) {
-        todo!("Unpickler::load_op")
+    fn load_binpersid(&self) -> Result<()> {
+        todo!("Unpickler::load_binpersid")
     }
 
-    fn load_none(&self) {
-        todo!("Unpickler::load_op")
+    fn load_reduce(&self) -> Result<()> {
+        todo!("Unpickler::load_reduce")
     }
 
-    fn load_persid(&self) {
-        todo!("Unpickler::load_op")
+    fn load_string(&self) -> Result<()> {
+        todo!("Unpickler::load_string")
     }
 
-    fn load_binpersid(&self) {
-        todo!("Unpickler::load_op")
+    fn load_binstring(&self) -> Result<()> {
+        todo!("Unpickler::load_binstring")
     }
 
-    fn load_reduce(&self) {
-        todo!("Unpickler::load_op")
+    fn load_short_binstring(&self) -> Result<()> {
+        todo!("Unpickler::load_short_binstring")
     }
 
-    fn load_string(&self) {
-        todo!("Unpickler::load_op")
+    fn load_unicode(&self) -> Result<()> {
+        todo!("Unpickler::load_unicode")
     }
 
-    fn load_binstring(&self) {
-        todo!("Unpickler::load_op")
+    fn load_binunicode(&self) -> Result<()> {
+        todo!("Unpickler::load_binunicode")
     }
 
-    fn load_short_binstring(&self) {
-        todo!("Unpickler::load_op")
+    fn load_append(&self) -> Result<()> {
+        todo!("Unpickler::load_append")
     }
 
-    fn load_unicode(&self) {
-        todo!("Unpickler::load_op")
+    fn load_build(&self) -> Result<()> {
+        todo!("Unpickler::load_build")
     }
 
-    fn load_binunicode(&self) {
-        todo!("Unpickler::load_op")
+    fn load_global(&self) -> Result<()> {
+        todo!("Unpickler::load_global")
     }
 
-    fn load_append(&self) {
-        todo!("Unpickler::load_op")
-    }
+    fn load_dict(&mut self) -> Result<()> {
+        let items = self.pop_mark();
+        let mut values = Vec::new();
+        for i in (0..items.len()).step_by(2) {
+            let key = items[i].clone();
+            let value = items[i + 1].clone();
+            values.push((key, value));
+        }
 
-    fn load_build(&self) {
-        todo!("Unpickler::load_op")
+        self.stack.push(Value::Dict(values));
+        Ok(())
     }
 
-    fn load_global(&self) {
-        todo!("Unpickler::load_op")
+    fn load_empty_dict(&self) -> Result<()> {
+        todo!("Unpickler::load_empty_dict")
     }
 
-    fn load_dict(&self) {
-        todo!("Unpickler::load_op")
+    fn load_appends(&self) -> Result<()> {
+        todo!("Unpickler::load_appends")
     }
 
-    fn load_empty_dict(&self) {
-        todo!("Unpickler::load_op")
+    fn load_get(&self) -> Result<()> {
+        todo!("Unpickler::load_get")
     }
 
-    fn load_appends(&self) {
-        todo!("Unpickler::load_op")
+    fn load_binget(&self) -> Result<()> {
+        todo!("Unpickler::load_binget")
     }
 
-    fn load_get(&self) {
-        todo!("Unpickler::load_op")
+    fn load_inst(&self) -> Result<()> {
+        todo!("Unpickler::load_inst")
     }
 
-    fn load_binget(&self) {
-        todo!("Unpickler::load_op")
+    fn load_long_binget(&self) -> Result<()> {
+        todo!("Unpickler::load_long_binget")
     }
 
-    fn load_inst(&self) {
-        todo!("Unpickler::load_op")
+    fn load_list(&self) -> Result<()> {
+        todo!("Unpickler::load_list")
     }
 
-    fn load_long_binget(&self) {
-        todo!("Unpickler::load_op")
+    fn load_empty_list(&self) -> Result<()> {
+        todo!("Unpickler::load_empty_list")
     }
 
-    fn load_list(&self) {
-        todo!("Unpickler::load_op")
+    fn load_obj(&self) -> Result<()> {
+        todo!("Unpickler::load_obj")
     }
 
-    fn load_empty_list(&self) {
-        todo!("Unpickler::load_op")
-    }
+    fn load_put(&mut self, mut file: impl BufRead) -> Result<()> {
+        let mut buf = String::new();
+        file.read_line(&mut buf)?;
 
-    fn load_obj(&self) {
-        todo!("Unpickler::load_op")
+        let i = buf.trim().parse::<u32>()?;
+        self.memo.insert(i, self.stack.last().unwrap().clone());
+        Ok(())
     }
 
-    fn load_put(&self) {
-        todo!("Unpickler::load_op")
+    fn load_binput(&self) -> Result<()> {
+        todo!("Unpickler::load_binput")
     }
 
-    fn load_binput(&self) {
-        todo!("Unpickler::load_op")
+    fn load_long_binput(&self) -> Result<()> {
+        todo!("Unpickler::load_long_binput")
     }
 
-    fn load_long_binput(&self) {
-        todo!("Unpickler::load_op")
+    fn load_setitem(&mut self) -> Result<()> {
+        let value = self.stack.pop().unwrap();
+        let key = self.stack.pop().unwrap();
+        let dict = self.stack.last_mut().unwrap();
+        match dict {
+            Value::Dict(dict) => {
+                dict.push((key, value));
+            }
+            _ => unreachable!("Instead of Dict found: {:?}", dict),
+        }
+        Ok(())
     }
 
-    fn load_setitem(&self) {
-        todo!("Unpickler::load_op")
+    fn load_tuple(&mut self) -> Result<()> {
+        let items = self.pop_mark();
+        self.stack.push(Value::Tuple(items));
+        Ok(())
     }
 
-    fn load_tuple(&self) {
-        todo!("Unpickler::load_op")
+    fn load_empty_tuple(&self) -> Result<()> {
+        todo!("Unpickler::load_empty_tuple")
     }
 
-    fn load_empty_tuple(&self) {
-        todo!("Unpickler::load_op")
+    fn load_setitems(&mut self) -> Result<()> {
+        todo!("Unpickler::load_setitems")
     }
 
-    fn load_setitems(&self) {
-        todo!("Unpickler::load_op")
+    fn load_binfloat(&self) -> Result<()> {
+        todo!("Unpickler::load_binfloat")
     }
 
-    fn load_binfloat(&self) {
-        todo!("Unpickler::load_op")
+    fn load_true(&self) -> Result<()> {
+        todo!("Unpickler::load_true")
     }
 
-    fn load_true(&self) {
-        todo!("Unpickler::load_op")
+    fn load_false(&self) -> Result<()> {
+        todo!("Unpickler::load_false")
     }
 
-    fn load_false(&self) {
-        todo!("Unpickler::load_op")
+    fn load_proto(&self) -> Result<()> {
+        todo!("Unpickler::load_proto")
     }
 
-    fn load_proto(&self) {
-        todo!("Unpickler::load_op")
+    fn load_newobj(&self) -> Result<()> {
+        todo!("Unpickler::load_newobj")
     }
 
-    fn load_newobj(&self) {
-        todo!("Unpickler::load_op")
+    fn load_ext1(&self) -> Result<()> {
+        todo!("Unpickler::load_ext1")
     }
 
-    fn load_ext1(&self) {
-        todo!("Unpickler::load_op")
+    fn load_ext2(&self) -> Result<()> {
+        todo!("Unpickler::load_ext2")
     }
 
-    fn load_ext2(&self) {
-        todo!("Unpickler::load_op")
+    fn load_ext4(&self) -> Result<()> {
+        todo!("Unpickler::load_ext4")
     }
 
-    fn load_ext4(&self) {
-        todo!("Unpickler::load_op")
+    fn load_tuple1(&self) -> Result<()> {
+        todo!("Unpickler::load_tuple1")
     }
 
-    fn load_tuple1(&self) {
-        todo!("Unpickler::load_op")
+    fn load_tuple2(&self) -> Result<()> {
+        todo!("Unpickler::load_tuple2")
     }
 
-    fn load_tuple2(&self) {
-        todo!("Unpickler::load_op")
+    fn load_tuple3(&self) -> Result<()> {
+        todo!("Unpickler::load_tuple3")
     }
 
-    fn load_tuple3(&self) {
-        todo!("Unpickler::load_op")
+    fn load_newtrue(&self) -> Result<()> {
+        todo!("Unpickler::load_newtrue")
     }
 
-    fn load_newtrue(&self) {
-        todo!("Unpickler::load_op")
+    fn load_newfalse(&self) -> Result<()> {
+        todo!("Unpickler::load_newfalse")
     }
 
-    fn load_newfalse(&self) {
-        todo!("Unpickler::load_op")
+    fn load_long1(&self) -> Result<()> {
+        todo!("Unpickler::load_long1")
     }
 
-    fn load_long1(&self) {
-        todo!("Unpickler::load_op")
+    fn load_long4(&self) -> Result<()> {
+        todo!("Unpickler::load_long4")
     }
 
-    fn load_long4(&self) {
-        todo!("Unpickler::load_op")
+    fn load_binbytes(&self) -> Result<()> {
+        todo!("Unpickler::load_binbytes")
     }
 
-    fn load_binbytes(&self) {
-        todo!("Unpickler::load_op")
+    fn load_short_binbytes(&self) -> Result<()> {
+        todo!("Unpickler::load_short_binbytes")
     }
 
-    fn load_short_binbytes(&self) {
-        todo!("Unpickler::load_op")
+    fn load_short_binunicode(&self) -> Result<()> {
+        todo!("Unpickler::load_short_binunicode")
     }
 
-    fn load_short_binunicode(&self) {
-        todo!("Unpickler::load_op")
+    fn load_binunicode8(&self) -> Result<()> {
+        todo!("Unpickler::load_binunicode8")
     }
 
-    fn load_binunicode8(&self) {
-        todo!("Unpickler::load_op")
+    fn load_binbytes8(&self) -> Result<()> {
+        todo!("Unpickler::load_binbytes8")
     }
 
-    fn load_binbytes8(&self) {
-        todo!("Unpickler::load_op")
+    fn load_empty_set(&self) -> Result<()> {
+        todo!("Unpickler::load_empty_set")
     }
 
-    fn load_empty_set(&self) {
-        todo!("Unpickler::load_op")
+    fn load_additems(&self) -> Result<()> {
+        todo!("Unpickler::load_additems")
     }
 
-    fn load_additems(&self) {
-        todo!("Unpickler::load_op")
+    fn load_frozenset(&self) -> Result<()> {
+        todo!("Unpickler::load_frozenset")
     }
 
-    fn load_frozenset(&self) {
-        todo!("Unpickler::load_op")
+    fn load_newobj_ex(&self) -> Result<()> {
+        todo!("Unpickler::load_newobj_ex")
     }
 
-    fn load_newobj_ex(&self) {
-        todo!("Unpickler::load_op")
+    fn load_stack_global(&self) -> Result<()> {
+        todo!("Unpickler::load_stack_global")
     }
 
-    fn load_stack_global(&self) {
-        todo!("Unpickler::load_op")
+    fn load_memoize(&self) -> Result<()> {
+        todo!("Unpickler::load_memoize")
     }
 
-    fn load_memoize(&self) {
-        todo!("Unpickler::load_op")
+    fn load_frame(&self) -> Result<()> {
+        todo!("Unpickler::load_frame")
     }
 
-    fn load_frame(&self) {
-        todo!("Unpickler::load_op")
+    fn load_bytearray8(&self) -> Result<()> {
+        todo!("Unpickler::load_bytearray8")
     }
 
-    fn load_bytearray8(&self) {
-        todo!("Unpickler::load_op")
+    fn load_next_buffer(&self) -> Result<()> {
+        todo!("Unpickler::load_next_buffer")
     }
 
-    fn load_next_buffer(&self) {
-        todo!("Unpickler::load_op")
+    fn load_readonly_buffer(&self) -> Result<()> {
+        todo!("Unpickler::load_readonly_buffer")
     }
 
-    fn load_readonly_buffer(&self) {
-        todo!("Unpickler::load_op")
+    fn pop_mark(&mut self) -> Vec<Value> {
+        let items = self.stack.clone();
+        self.stack = self.metastack.pop().unwrap();
+        items
     }
 }
 

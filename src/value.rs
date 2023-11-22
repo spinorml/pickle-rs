@@ -18,8 +18,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use num_bigint::BigInt;
-
 pub type MemoId = u32;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -39,36 +37,15 @@ pub enum Value {
     Global(Global),
     None,
     Bool(bool),
+    Int(i32),
     I64(i64),
-    Int(BigInt),
+    I128(i128),
     F64(f64),
     Bytes(Vec<u8>),
     String(String),
     List(Vec<Value>),
     Tuple(Vec<Value>),
-    Set(Vec<HashableValue>),
-    FrozenSet(Vec<HashableValue>),
-    Dict(Vec<(HashableValue, Value)>),
-}
-
-#[derive(Clone, Debug, PartialEq, PartialOrd)]
-pub enum HashableValue {
-    /// None
-    None,
-    /// Boolean
-    Bool(bool),
-    /// Short integer
-    I64(i64),
-    /// Long integer
-    Int(BigInt),
-    /// Float
-    F64(f64),
-    /// Bytestring
-    Bytes(Vec<u8>),
-    /// Unicode string
-    String(String),
-    /// Tuple
-    Tuple(Vec<HashableValue>),
-    /// Frozen (immutable) set
-    FrozenSet(Vec<HashableValue>),
+    Set(Vec<Value>),
+    FrozenSet(Vec<Value>),
+    Dict(Vec<(Value, Value)>),
 }
