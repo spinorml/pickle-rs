@@ -564,14 +564,6 @@ impl Unpickler {
         todo!("Unpickler::load_binfloat")
     }
 
-    fn load_true(&self) -> Result<()> {
-        todo!("Unpickler::load_true")
-    }
-
-    fn load_false(&self) -> Result<()> {
-        todo!("Unpickler::load_false")
-    }
-
     fn load_proto(&mut self, mut file: impl BufRead) -> Result<()> {
         // proto = self.read(1)[0]
         // if not 0 <= proto <= HIGHEST_PROTOCOL:
