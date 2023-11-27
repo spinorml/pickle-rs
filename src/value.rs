@@ -48,4 +48,6 @@ pub enum Value {
     Set(Vec<Value>),
     FrozenSet(Vec<Value>),
     Dict(Vec<(Value, Value)>),
+    PersId(String),
+    BinPersId(Box<Value>),
 }

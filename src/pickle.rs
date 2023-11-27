@@ -131,6 +131,7 @@ pub struct Unpickler {
     metastack: Vec<Vec<Value>>,
     stack: Vec<Value>,
     memo: HashMap<u32, Value>,
+    proto: u8,
 }
 
 impl Unpickler {
@@ -140,6 +141,7 @@ impl Unpickler {
             metastack: Vec::new(),
             stack: Vec::new(),
             memo: HashMap::new(),
+            proto: 0,
         }
     }
 
@@ -180,19 +182,19 @@ impl Unpickler {
             DUP => self.load_dup(),
             FLOAT => self.load_float(&mut file),
             INT => self.load_int(&mut file),
-            BININT => self.load_binint(),
-            BININT1 => self.load_binint1(),
+            BININT => self.load_binint(&mut file),
+            BININT1 => self.load_binint1(&mut file),
             LONG => self.load_long(&mut file),
-            BININT2 => self.load_binint2(),
+            BININT2 => self.load_binint2(&mut file),
             NONE => self.load_none(),
-            PERSID => self.load_persid(),
+            PERSID => self.load_persid(&mut file),
             BINPERSID => self.load_binpersid(),
             REDUCE => self.load_reduce(),
-            STRING => self.load_string(),
-            BINSTRING => self.load_binstring(),
-            SHORT_BINSTRING => self.load_short_binstring(),
-            UNICODE => self.load_unicode(),
-            BINUNICODE => self.load_binunicode(),
+            STRING => self.load_string(&mut file),
+            BINSTRING => self.load_binstring(&mut file),
+            SHORT_BINSTRING => self.load_short_binstring(&mut file),
+            UNICODE => self.load_unicode(&mut file),
+            BINUNICODE => self.load_binunicode(&mut file),
             APPEND => self.load_append(),
             BUILD => self.load_build(),
             GLOBAL => self.load_global(),
@@ -214,7 +216,7 @@ impl Unpickler {
             EMPTY_TUPLE => self.load_empty_tuple(),
             SETITEMS => self.load_setitems(),
             BINFLOAT => self.load_binfloat(),
-            PROTO => self.load_proto(),
+            PROTO => self.load_proto(&mut file),
             NEWOBJ => self.load_newobj(),
             EXT1 => self.load_ext1(),
             EXT2 => self.load_ext2(),
@@ -255,16 +257,28 @@ impl Unpickler {
         self.stack.pop()
     }
 
-    fn load_pop(&self) -> Result<()> {
-        todo!("Unpickler::load_pop")
+    fn load_pop(&mut self) -> Result<()> {
+        if self.stack.len() > 0 {
+            self.stack.pop();
+        } else {
+            self.pop_mark();
+        }
+        Ok(())
     }
 
-    fn load_pop_mark(&self) -> Result<()> {
-        todo!("Unpickler::load_pop_mark")
+    fn load_pop_mark(&mut self) -> Result<()> {
+        self.pop_mark();
+        Ok(())
     }
 
-    fn load_dup(&self) -> Result<()> {
-        todo!("Unpickler::load_dup")
+    fn load_dup(&mut self) -> Result<()> {
+        let value = self
+            .stack
+            .last()
+            .ok_or_else(|| Error::Syntax(ErrorCode::StackUnderflow))?
+            .clone();
+        self.stack.push(value);
+        Ok(())
     }
 
     fn load_float(&mut self, mut file: impl BufRead) -> Result<()> {
@@ -291,12 +305,21 @@ impl Unpickler {
         Ok(())
     }
 
-    fn load_binint(&self) -> Result<()> {
-        todo!("Unpickler::load_binint")
+    fn load_binint(&mut self, mut file: impl BufRead) -> Result<()> {
+        let mut buf = [0; 4];
+        file.read_exact(&mut buf)?;
+
+        let value = LittleEndian::read_i32(&buf);
+        self.stack.push(Value::Int(value));
+        Ok(())
     }
 
-    fn load_binint1(&self) -> Result<()> {
-        todo!("Unpickler::load_binint1")
+    fn load_binint1(&mut self, mut file: impl BufRead) -> Result<()> {
+        let mut buf = [0; 1];
+        file.read_exact(&mut buf)?;
+        let value = buf[0] as i32;
+        self.stack.push(Value::Int(value));
+        Ok(())
     }
 
     fn load_long(&mut self, mut file: impl BufRead) -> Result<()> {
@@ -310,48 +333,125 @@ impl Unpickler {
         Ok(())
     }
 
-    fn load_binint2(&self) -> Result<()> {
+    fn load_binint2(&mut self, mut file: impl BufRead) -> Result<()> {
+        let mut buf = [0; 2];
+        file.read_exact(&mut buf)?;
+
+        let value = LittleEndian::read_u16(&buf);
+        self.stack.push(Value::Int(value as i32));
         todo!("Unpickler::load_binint2")
     }
 
-    fn load_none(&self) -> Result<()> {
-        todo!("Unpickler::load_none")
+    fn load_none(&mut self) -> Result<()> {
+        self.stack.push(Value::None);
+        Ok(())
     }
 
-    fn load_persid(&self) -> Result<()> {
-        todo!("Unpickler::load_persid")
+    fn load_persid(&mut self, mut file: impl BufRead) -> Result<()> {
+        let mut buf = String::new();
+        file.read_line(&mut buf)?;
+        self.stack.push(Value::PersId(buf));
+        Ok(())
     }
 
-    fn load_binpersid(&self) -> Result<()> {
-        todo!("Unpickler::load_binpersid")
+    fn load_binpersid(&mut self) -> Result<()> {
+        let value = self
+            .stack
+            .pop()
+            .ok_or_else(|| Error::Syntax(ErrorCode::StackUnderflow))?;
+
+        self.stack.push(Value::BinPersId(Box::new(value)));
+        Ok(())
     }
 
     fn load_reduce(&self) -> Result<()> {
-        todo!("Unpickler::load_reduce")
+        panic!("load_reduce: not supported")
     }
 
-    fn load_string(&self) -> Result<()> {
-        todo!("Unpickler::load_string")
+    fn load_string(&mut self, mut file: impl BufRead) -> Result<()> {
+        let mut buf = Vec::new();
+        file.read_until(b'\n', &mut buf)?;
+        buf.pop()
+            .ok_or_else(|| Error::Syntax(ErrorCode::InvalidString))?;
+
+        if buf.len() > 3 && buf[0] == b'\'' && buf[0] == buf[buf.len() - 2] {
+            let s = self.decode_string(buf[1..buf.len() - 2].as_ref())?;
+            self.stack.push(Value::String(s));
+            Ok(())
+        } else {
+            Err(Error::Syntax(ErrorCode::InvalidString))
+        }
     }
 
-    fn load_binstring(&self) -> Result<()> {
-        todo!("Unpickler::load_binstring")
+    fn load_binstring(&mut self, mut file: impl BufRead) -> Result<()> {
+        let mut buf = [0; 4];
+        file.read_exact(&mut buf)?;
+
+        let len = LittleEndian::read_i32(&buf) as usize;
+        let mut buf = vec![0; len];
+        file.read_exact(&mut buf)?;
+
+        let s = self.decode_string(&buf)?;
+        self.stack.push(Value::String(s));
+        Ok(())
     }
 
-    fn load_short_binstring(&self) -> Result<()> {
-        todo!("Unpickler::load_short_binstring")
+    fn load_short_binstring(&mut self, mut file: impl BufRead) -> Result<()> {
+        let mut buf = [0; 1];
+        file.read_exact(&mut buf)?;
+
+        let len = buf[0] as usize;
+        let mut buf = vec![0; len];
+        file.read_exact(&mut buf)?;
+
+        let s = self.decode_string(&buf)?;
+        self.stack.push(Value::String(s));
+        Ok(())
     }
 
-    fn load_unicode(&self) -> Result<()> {
-        todo!("Unpickler::load_unicode")
+    fn load_unicode(&mut self, mut file: impl BufRead) -> Result<()> {
+        let mut buf = Vec::new();
+        file.read_until(b'\n', &mut buf)?;
+
+        let s = String::from_utf8(buf)?;
+        self.stack.push(Value::String(s));
+        Ok(())
     }
 
-    fn load_binunicode(&self) -> Result<()> {
-        todo!("Unpickler::load_binunicode")
+    fn load_binunicode(&mut self, mut file: impl BufRead) -> Result<()> {
+        let mut buf = [0; 4];
+        file.read_exact(&mut buf)?;
+
+        let n = LittleEndian::read_u32(&buf) as usize;
+        let mut buf = vec![0; n];
+        file.read_exact(&mut buf)?;
+
+        let s = String::from_utf8(buf)?;
+        self.stack.push(Value::String(s));
+        Ok(())
     }
 
-    fn load_append(&self) -> Result<()> {
-        todo!("Unpickler::load_append")
+    fn load_append(&mut self) -> Result<()> {
+        let value = self
+            .stack
+            .pop()
+            .ok_or_else(|| Error::Syntax(ErrorCode::StackUnderflow))?;
+
+        let list = self
+            .stack
+            .last_mut()
+            .ok_or_else(|| Error::Syntax(ErrorCode::StackUnderflow))?;
+
+        match list {
+            Value::List(ref mut l) => {
+                l.push(value);
+                Ok(())
+            }
+            _ => Err(Error::Syntax(ErrorCode::InvalidValue(format!(
+                "Expected list on stack but found {:?}",
+                list
+            )))),
+        }
     }
 
     fn load_build(&self) -> Result<()> {
@@ -359,6 +459,11 @@ impl Unpickler {
     }
 
     fn load_global(&self) -> Result<()> {
+        // module = self.readline()[:-1].decode("utf-8")
+        // name = self.readline()[:-1].decode("utf-8")
+        // klass = self.find_class(module, name)
+        // self.append(klass)
+
         todo!("Unpickler::load_global")
     }
 
@@ -467,8 +572,25 @@ impl Unpickler {
         todo!("Unpickler::load_false")
     }
 
-    fn load_proto(&self) -> Result<()> {
-        todo!("Unpickler::load_proto")
+    fn load_proto(&mut self, mut file: impl BufRead) -> Result<()> {
+        // proto = self.read(1)[0]
+        // if not 0 <= proto <= HIGHEST_PROTOCOL:
+        //     raise ValueError("unsupported pickle protocol: %d" % proto)
+        // self.proto = proto
+        const HIGHEST_PROTOCOL: u8 = 5;
+
+        let mut buf = [0; 1];
+        file.read_exact(&mut buf)?;
+        let proto = buf[0];
+
+        if (0..=HIGHEST_PROTOCOL).contains(&proto) {
+            self.proto = proto;
+        } else {
+            return Err(Error::Syntax(ErrorCode::InvalidValue(
+                "unsupported pickle protocol".to_string(),
+            )));
+        }
+        Ok(())
     }
 
     fn load_newobj(&self) -> Result<()> {
@@ -579,6 +701,10 @@ impl Unpickler {
         let items = self.stack.clone();
         self.stack = self.metastack.pop().unwrap();
         items
+    }
+
+    fn decode_string(&self, _data: &[u8]) -> Result<String> {
+        todo!("Unpickler::decode_string")
     }
 }
 

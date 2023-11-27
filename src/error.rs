@@ -23,6 +23,7 @@ use std::io;
 use std::num::ParseFloatError;
 use std::num::ParseIntError;
 use std::result;
+use std::string::FromUtf8Error;
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum ErrorCode {
@@ -34,6 +35,8 @@ pub enum ErrorCode {
     StackUnderflow,
     /// Length prefix found negative
     NegativeLength,
+    /// Invalid string format
+    InvalidString,
     /// String decoding as UTF-8 failed
     StringNotUTF8,
     /// Wrong stack top type for opcode
@@ -65,6 +68,7 @@ impl fmt::Display for ErrorCode {
             ErrorCode::EOFWhileParsing => write!(fmt, "EOF while parsing"),
             ErrorCode::StackUnderflow => write!(fmt, "pickle stack underflow"),
             ErrorCode::NegativeLength => write!(fmt, "negative length prefix"),
+            ErrorCode::InvalidString => write!(fmt, "invalid string format"),
             ErrorCode::StringNotUTF8 => write!(fmt, "string is not UTF-8 encoded"),
             ErrorCode::InvalidStackTop(what, ref it) => {
                 write!(fmt, "invalid stack top, expected {}, got {}", what, it)
@@ -116,6 +120,12 @@ impl From<ParseIntError> for Error {
 impl From<ParseFloatError> for Error {
     fn from(err: ParseFloatError) -> Error {
         Error::Syntax(ErrorCode::InvalidValue(err.to_string()))
+    }
+}
+
+impl From<FromUtf8Error> for Error {
+    fn from(err: FromUtf8Error) -> Error {
+        Error::Syntax(ErrorCode::StringNotUTF8)
     }
 }
 
