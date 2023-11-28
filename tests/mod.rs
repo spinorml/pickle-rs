@@ -21,7 +21,6 @@
 
 use std::{fs::File, io::BufReader};
 
-use num_bigint::BigInt;
 use pickle_rs::{Error, ErrorCode, Unpickler, UnpicklerOptions, Value};
 
 macro_rules! pyobj {

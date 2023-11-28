@@ -21,11 +21,11 @@
 use std::collections::HashMap;
 use std::io::BufRead;
 
-use byteorder::{BigEndian, ByteOrder, LittleEndian};
+use byteorder::{ByteOrder, LittleEndian};
 
 use crate::error::Result;
 use crate::value::Value;
-use crate::{Error, ErrorCode};
+use crate::{Error, ErrorCode, MemoId};
 
 const MARK: u8 = b'('; // push special markobject on stack
 const STOP: u8 = b'.'; // every pickle ends with STOP
@@ -130,7 +130,7 @@ pub struct Unpickler {
     options: UnpicklerOptions,
     metastack: Vec<Vec<Value>>,
     stack: Vec<Value>,
-    memo: HashMap<u32, Value>,
+    memo: HashMap<MemoId, Value>,
     proto: u8,
 }
 
@@ -197,11 +197,11 @@ impl Unpickler {
             BINUNICODE => self.load_binunicode(&mut file),
             APPEND => self.load_append(),
             BUILD => self.load_build(),
-            GLOBAL => self.load_global(),
+            GLOBAL => self.load_global(&mut file),
             DICT => self.load_dict(),
             EMPTY_DICT => self.load_empty_dict(),
             APPENDS => self.load_appends(),
-            GET => self.load_get(),
+            GET => self.load_get(&mut file),
             BINGET => self.load_binget(),
             INST => self.load_inst(),
             LONG_BINGET => self.load_long_binget(),
@@ -258,10 +258,10 @@ impl Unpickler {
     }
 
     fn load_pop(&mut self) -> Result<()> {
-        if self.stack.len() > 0 {
-            self.stack.pop();
-        } else {
+        if self.stack.is_empty() {
             self.pop_mark();
+        } else {
+            self.stack.pop();
         }
         Ok(())
     }
@@ -364,17 +364,31 @@ impl Unpickler {
         Ok(())
     }
 
-    fn load_reduce(&self) -> Result<()> {
-        panic!("load_reduce: not supported")
+    fn load_reduce(&mut self) -> Result<()> {
+        let args = self.stack.pop().ok_or_else(|| {
+            Error::Syntax(ErrorCode::InvalidStackTop(
+                "reduce: expected args on stack",
+                "nothing".to_string(),
+            ))
+        })?;
+
+        let func = self.stack.pop().ok_or_else(|| {
+            Error::Syntax(ErrorCode::InvalidStackTop(
+                "reduce: expected func on stack",
+                "nothing".to_string(),
+            ))
+        })?;
+
+        self.stack
+            .push(Value::Reduce(Box::new(func), Box::new(args)));
+        Ok(())
     }
 
     fn load_string(&mut self, mut file: impl BufRead) -> Result<()> {
         let mut buf = Vec::new();
         file.read_until(b'\n', &mut buf)?;
-        buf.pop()
-            .ok_or_else(|| Error::Syntax(ErrorCode::InvalidString))?;
 
-        if buf.len() > 3 && buf[0] == b'\'' && buf[0] == buf[buf.len() - 2] {
+        if buf.len() > 2 && buf[0] == b'\'' && buf[0] == buf[buf.len() - 2] {
             let s = self.decode_string(buf[1..buf.len() - 2].as_ref())?;
             self.stack.push(Value::String(s));
             Ok(())
@@ -454,17 +468,37 @@ impl Unpickler {
         }
     }
 
-    fn load_build(&self) -> Result<()> {
-        todo!("Unpickler::load_build")
+    fn load_build(&mut self) -> Result<()> {
+        // The top-of-stack for BUILD is used either as the instance __dict__,
+        // or an argument for __setstate__, in which case it can be *any* type
+        // of object.  In both cases, we just replace the standin.
+        let state = self.stack.pop().ok_or_else(|| {
+            Error::Syntax(ErrorCode::InvalidStackTop(
+                "build: expected state on stack",
+                "nothing".to_string(),
+            ))
+        })?;
+
+        self.stack.pop().ok_or_else(|| {
+            Error::Syntax(ErrorCode::InvalidStackTop(
+                "build: expected class on stack",
+                "nothing".to_string(),
+            ))
+        })?; // remove the object standin
+
+        self.stack.push(state);
+        Ok(())
     }
 
-    fn load_global(&self) -> Result<()> {
-        // module = self.readline()[:-1].decode("utf-8")
-        // name = self.readline()[:-1].decode("utf-8")
-        // klass = self.find_class(module, name)
-        // self.append(klass)
+    fn load_global(&mut self, mut file: impl BufRead) -> Result<()> {
+        let mut module = String::new();
+        file.read_line(&mut module)?;
 
-        todo!("Unpickler::load_global")
+        let mut name = String::new();
+        file.read_line(&mut name)?;
+
+        self.stack.push(Value::Class(module, name));
+        Ok(())
     }
 
     fn load_dict(&mut self) -> Result<()> {
@@ -488,7 +522,7 @@ impl Unpickler {
         todo!("Unpickler::load_appends")
     }
 
-    fn load_get(&self) -> Result<()> {
+    fn load_get(&mut self, mut _file: impl BufRead) -> Result<()> {
         todo!("Unpickler::load_get")
     }
 
@@ -504,8 +538,10 @@ impl Unpickler {
         todo!("Unpickler::load_long_binget")
     }
 
-    fn load_list(&self) -> Result<()> {
-        todo!("Unpickler::load_list")
+    fn load_list(&mut self) -> Result<()> {
+        let items = self.pop_mark();
+        self.stack.push(Value::List(items));
+        Ok(())
     }
 
     fn load_empty_list(&self) -> Result<()> {
@@ -516,13 +552,8 @@ impl Unpickler {
         todo!("Unpickler::load_obj")
     }
 
-    fn load_put(&mut self, mut file: impl BufRead) -> Result<()> {
-        let mut buf = String::new();
-        file.read_line(&mut buf)?;
-
-        let i = buf.trim().parse::<u32>()?;
-        self.memo.insert(i, self.stack.last().unwrap().clone());
-        Ok(())
+    fn load_put(&mut self, mut _file: impl BufRead) -> Result<()> {
+        todo!("Unpickler::load_put")
     }
 
     fn load_binput(&self) -> Result<()> {
@@ -695,8 +726,8 @@ impl Unpickler {
         items
     }
 
-    fn decode_string(&self, _data: &[u8]) -> Result<String> {
-        todo!("Unpickler::decode_string")
+    fn decode_string(&self, data: &[u8]) -> Result<String> {
+        Ok(String::from_utf8(data.to_vec())?)
     }
 }
 

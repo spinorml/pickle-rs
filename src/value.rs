@@ -50,4 +50,6 @@ pub enum Value {
     Dict(Vec<(Value, Value)>),
     PersId(String),
     BinPersId(Box<Value>),
+    Class(String, String),
+    Reduce(Box<Value>, Box<Value>),
 }

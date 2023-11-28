@@ -124,7 +124,7 @@ impl From<ParseFloatError> for Error {
 }
 
 impl From<FromUtf8Error> for Error {
-    fn from(err: FromUtf8Error) -> Error {
+    fn from(_: FromUtf8Error) -> Error {
         Error::Syntax(ErrorCode::StringNotUTF8)
     }
 }
