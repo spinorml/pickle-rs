@@ -18,8 +18,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io::BufRead;
+use std::str;
 
 use byteorder::{ByteOrder, LittleEndian};
 
@@ -107,8 +109,8 @@ const BYTEARRAY8: u8 = b'\x96'; // push bytearray
 const NEXT_BUFFER: u8 = b'\x97'; // push next out-of-band buffer
 const READONLY_BUFFER: u8 = b'\x98'; // make top of stack readonly
 
-const TRUE: &[u8; 4] = b"I01\n"; // not an opcode; see INT docs in pickletools.py
-const FALSE: &[u8; 4] = b"I00\n"; // not an opcode; see INT docs in pickletools.py
+const TRUE: &str = "01"; // not an opcode; see INT docs in pickletools.py
+const FALSE: &str = "00"; // not an opcode; see INT docs in pickletools.py
 
 pub struct UnpicklerOptions {
     fix_imports: bool,
@@ -290,15 +292,17 @@ impl Unpickler {
     }
 
     fn load_int(&mut self, mut file: impl BufRead) -> Result<()> {
-        let mut buf = String::new();
-        file.read_line(&mut buf)?;
+        let mut buf = Vec::new();
+        file.read_until(b'\n', &mut buf)?;
+        buf.remove(buf.len() - 1); // remove the newline
+        let value = self.parse_string(&buf)?;
 
-        if buf.as_bytes() == TRUE {
+        if value == TRUE {
             self.stack.push(Value::Bool(true));
-        } else if buf.as_bytes() == FALSE {
+        } else if value == FALSE {
             self.stack.push(Value::Bool(false));
         } else {
-            let i = buf.trim().parse::<i32>()?;
+            let i = value.parse::<i32>()?;
             self.stack.push(Value::Int(i));
         }
 
@@ -327,7 +331,6 @@ impl Unpickler {
         file.read_line(&mut buf)?;
 
         let buf = buf.trim().trim_end_matches('L');
-        println!("I64 buf: {}", buf);
         let value = buf.parse::<i128>()?;
         self.stack.push(Value::I128(value));
         Ok(())
@@ -389,7 +392,7 @@ impl Unpickler {
         file.read_until(b'\n', &mut buf)?;
 
         if buf.len() > 2 && buf[0] == b'\'' && buf[0] == buf[buf.len() - 2] {
-            let s = self.decode_string(buf[1..buf.len() - 2].as_ref())?;
+            let s = self.parse_string(buf[1..buf.len() - 2].as_ref())?;
             self.stack.push(Value::String(s));
             Ok(())
         } else {
@@ -405,7 +408,7 @@ impl Unpickler {
         let mut buf = vec![0; len];
         file.read_exact(&mut buf)?;
 
-        let s = self.decode_string(&buf)?;
+        let s = self.parse_string(&buf)?;
         self.stack.push(Value::String(s));
         Ok(())
     }
@@ -418,7 +421,7 @@ impl Unpickler {
         let mut buf = vec![0; len];
         file.read_exact(&mut buf)?;
 
-        let s = self.decode_string(&buf)?;
+        let s = self.parse_string(&buf)?;
         self.stack.push(Value::String(s));
         Ok(())
     }
@@ -427,8 +430,8 @@ impl Unpickler {
         let mut buf = Vec::new();
         file.read_until(b'\n', &mut buf)?;
 
-        let s = String::from_utf8(buf)?;
-        self.stack.push(Value::String(s));
+        buf.remove(buf.len() - 1); // remove the newline
+        self.stack.push(Value::Bytes(buf));
         Ok(())
     }
 
@@ -440,7 +443,7 @@ impl Unpickler {
         let mut buf = vec![0; n];
         file.read_exact(&mut buf)?;
 
-        let s = String::from_utf8(buf)?;
+        let s = str::from_utf8(&buf).unwrap().trim().to_string();
         self.stack.push(Value::String(s));
         Ok(())
     }
@@ -493,9 +496,11 @@ impl Unpickler {
     fn load_global(&mut self, mut file: impl BufRead) -> Result<()> {
         let mut module = String::new();
         file.read_line(&mut module)?;
+        let module = module.trim().to_string();
 
         let mut name = String::new();
         file.read_line(&mut name)?;
+        let name = name.trim().to_string();
 
         self.stack.push(Value::Class(module, name));
         Ok(())
@@ -522,8 +527,17 @@ impl Unpickler {
         todo!("Unpickler::load_appends")
     }
 
-    fn load_get(&mut self, mut _file: impl BufRead) -> Result<()> {
-        todo!("Unpickler::load_get")
+    fn load_get(&mut self, mut file: impl BufRead) -> Result<()> {
+        let mut buf = Vec::new();
+        file.read_until(b'\n', &mut buf)?;
+        let memo_id = self.parse_string(&buf)?.parse::<MemoId>()?;
+        let value = self
+            .memo
+            .get(&memo_id)
+            .ok_or_else(|| Error::Syntax(ErrorCode::MissingMemo(memo_id)))?
+            .clone();
+        self.stack.push(value);
+        Ok(())
     }
 
     fn load_binget(&self) -> Result<()> {
@@ -552,8 +566,27 @@ impl Unpickler {
         todo!("Unpickler::load_obj")
     }
 
-    fn load_put(&mut self, mut _file: impl BufRead) -> Result<()> {
-        todo!("Unpickler::load_put")
+    fn load_put(&mut self, mut file: impl BufRead) -> Result<()> {
+        // i = int(self.readline()[:-1])
+        // if i < 0:
+        //     raise ValueError("negative PUT argument")
+        // self.memo[i] = self.stack[-1]
+        let mut buf = Vec::new();
+        file.read_until(b'\n', &mut buf)?;
+        let memo_id: i32 = String::from_utf8(buf)?.trim().parse()?;
+        if memo_id < 0 {
+            return Err(Error::Syntax(ErrorCode::InvalidValue(
+                "negative PUT argument".to_string(),
+            )));
+        }
+        let value = self
+            .stack
+            .last()
+            .ok_or_else(|| Error::Syntax(ErrorCode::StackUnderflow))?
+            .clone();
+
+        self.memo.insert(memo_id as MemoId, value);
+        Ok(())
     }
 
     fn load_binput(&self) -> Result<()> {
@@ -726,8 +759,8 @@ impl Unpickler {
         items
     }
 
-    fn decode_string(&self, data: &[u8]) -> Result<String> {
-        Ok(String::from_utf8(data.to_vec())?)
+    fn parse_string(&self, data: &[u8]) -> Result<String> {
+        Ok(str::from_utf8(data).unwrap().trim().to_string())
     }
 }
 
