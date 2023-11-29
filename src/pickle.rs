@@ -431,7 +431,13 @@ impl Unpickler {
         file.read_until(b'\n', &mut buf)?;
 
         buf.remove(buf.len() - 1); // remove the newline
-        self.stack.push(Value::Bytes(buf));
+        let value = self.parse_string(&buf);
+        if let Ok(value) = value {
+            self.stack.push(Value::String(value));
+        } else {
+            self.stack.push(Value::Bytes(buf))
+        }
+
         Ok(())
     }
 
@@ -760,7 +766,11 @@ impl Unpickler {
     }
 
     fn parse_string(&self, data: &[u8]) -> Result<String> {
-        Ok(str::from_utf8(data).unwrap().trim().to_string())
+        if let Ok(value) = str::from_utf8(data) {
+            Ok(value.trim().to_string())
+        } else {
+            Err(Error::Syntax(ErrorCode::InvalidString))
+        }
     }
 }
 

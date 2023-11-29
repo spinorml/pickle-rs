@@ -27,8 +27,9 @@ macro_rules! pyobj {
     (n=None)     => { Value::None };
     (b=True)     => { Value::Bool(true) };
     (b=False)    => { Value::Bool(false) };
-    (i=$i:expr)  => { Value::I64($i) };
-    (ii=$i:expr) => { Value::Int($i) };
+    (i=$i:expr)  => { Value::Int($i) };
+    (ii=$i:expr) => { Value::I64($i) };
+    (iii=$i:expr) => { Value::I128($i) };
     (f=$f:expr)  => { Value::F64($f) };
     (bb=$b:expr) => { Value::Bytes($b.to_vec()) };
     (s=$s:expr)  => { Value::String($s.into()) };
@@ -55,12 +56,12 @@ const TEST_CASES: &[(u32, u32)] = &[
 ];
 
 fn get_test_object(pyver: u32) -> Value {
-    let longish = 1000000 * 1000;
+    let longish: i128 = 100000000000000000000;
     let mut obj = pyobj!(d={
         n=None           => n=None,
         b=False          => t=(b=False, b=True),
         i=10             => i=100000,
-        ii=longish       => ii=longish,
+        iii=longish       => iii=longish,
         f=1.0            => f=1.0,
         bb=b"bytes"      => bb=b"bytes",
         s="string"       => s="string",
