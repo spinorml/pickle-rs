@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::io::BufRead;
 use std::str;
 
-use byteorder::{ByteOrder, LittleEndian};
+use byteorder::{BigEndian, ByteOrder, LittleEndian};
 
 use crate::error::Result;
 use crate::value::Value;
@@ -204,20 +204,20 @@ impl Unpickler {
             EMPTY_DICT => self.load_empty_dict(),
             APPENDS => self.load_appends(),
             GET => self.load_get(&mut file),
-            BINGET => self.load_binget(),
+            BINGET => self.load_binget(&mut file),
             INST => self.load_inst(),
             LONG_BINGET => self.load_long_binget(),
             LIST => self.load_list(),
             EMPTY_LIST => self.load_empty_list(),
             OBJ => self.load_obj(),
             PUT => self.load_put(&mut file),
-            BINPUT => self.load_binput(),
+            BINPUT => self.load_binput(&mut file),
             LONG_BINPUT => self.load_long_binput(),
             SETITEM => self.load_setitem(),
             TUPLE => self.load_tuple(),
             EMPTY_TUPLE => self.load_empty_tuple(),
             SETITEMS => self.load_setitems(),
-            BINFLOAT => self.load_binfloat(),
+            BINFLOAT => self.load_binfloat(&mut file),
             PROTO => self.load_proto(&mut file),
             NEWOBJ => self.load_newobj(),
             EXT1 => self.load_ext1(),
@@ -525,12 +525,30 @@ impl Unpickler {
         Ok(())
     }
 
-    fn load_empty_dict(&self) -> Result<()> {
-        todo!("Unpickler::load_empty_dict")
+    fn load_empty_dict(&mut self) -> Result<()> {
+        self.stack.push(Value::Dict(Vec::new()));
+        Ok(())
     }
 
-    fn load_appends(&self) -> Result<()> {
-        todo!("Unpickler::load_appends")
+    fn load_appends(&mut self) -> Result<()> {
+        let items = self.pop_mark();
+        let list = self
+            .stack
+            .last_mut()
+            .ok_or_else(|| Error::Syntax(ErrorCode::StackUnderflow))?;
+
+        match list {
+            Value::List(ref mut l) => {
+                for item in items {
+                    l.push(item);
+                }
+                Ok(())
+            }
+            _ => Err(Error::Syntax(ErrorCode::InvalidValue(format!(
+                "Expected list on stack but found {:?}",
+                list
+            )))),
+        }
     }
 
     fn load_get(&mut self, mut file: impl BufRead) -> Result<()> {
@@ -546,8 +564,17 @@ impl Unpickler {
         Ok(())
     }
 
-    fn load_binget(&self) -> Result<()> {
-        todo!("Unpickler::load_binget")
+    fn load_binget(&mut self, mut file: impl BufRead) -> Result<()> {
+        let mut buf = [0; 1];
+        file.read_exact(&mut buf)?;
+        let memo_id = buf[0] as MemoId;
+        let value = self
+            .memo
+            .get(&memo_id)
+            .ok_or_else(|| Error::Syntax(ErrorCode::MissingMemo(memo_id)))?
+            .clone();
+        self.stack.push(value);
+        Ok(())
     }
 
     fn load_inst(&self) -> Result<()> {
@@ -564,8 +591,9 @@ impl Unpickler {
         Ok(())
     }
 
-    fn load_empty_list(&self) -> Result<()> {
-        todo!("Unpickler::load_empty_list")
+    fn load_empty_list(&mut self) -> Result<()> {
+        self.stack.push(Value::List(Vec::new()));
+        Ok(())
     }
 
     fn load_obj(&self) -> Result<()> {
@@ -595,8 +623,17 @@ impl Unpickler {
         Ok(())
     }
 
-    fn load_binput(&self) -> Result<()> {
-        todo!("Unpickler::load_binput")
+    fn load_binput(&mut self, mut file: impl BufRead) -> Result<()> {
+        let mut buf = [0; 1];
+        file.read_exact(&mut buf)?;
+        let memo_id = buf[0] as MemoId;
+        let value = self
+            .stack
+            .last()
+            .ok_or_else(|| Error::Syntax(ErrorCode::StackUnderflow))?
+            .clone();
+        self.memo.insert(memo_id, value);
+        Ok(())
     }
 
     fn load_long_binput(&self) -> Result<()> {
@@ -622,16 +659,33 @@ impl Unpickler {
         Ok(())
     }
 
-    fn load_empty_tuple(&self) -> Result<()> {
-        todo!("Unpickler::load_empty_tuple")
+    fn load_empty_tuple(&mut self) -> Result<()> {
+        self.stack.push(Value::Tuple(Vec::new()));
+        Ok(())
     }
 
     fn load_setitems(&mut self) -> Result<()> {
-        todo!("Unpickler::load_setitems")
+        let items = self.pop_mark();
+        let dict = self.stack.last_mut().unwrap();
+        match dict {
+            Value::Dict(dict) => {
+                for i in (0..items.len()).step_by(2) {
+                    let key = items[i].clone();
+                    let value = items[i + 1].clone();
+                    dict.push((key, value));
+                }
+            }
+            _ => unreachable!("Instead of Dict found: {:?}", dict),
+        }
+        Ok(())
     }
 
-    fn load_binfloat(&self) -> Result<()> {
-        todo!("Unpickler::load_binfloat")
+    fn load_binfloat(&mut self, mut file: impl BufRead) -> Result<()> {
+        let mut buf = [0; 8];
+        file.read_exact(&mut buf)?;
+        let value = BigEndian::read_f64(&buf);
+        self.stack.push(Value::F64(value));
+        Ok(())
     }
 
     fn load_proto(&mut self, mut file: impl BufRead) -> Result<()> {
