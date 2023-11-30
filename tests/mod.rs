@@ -56,37 +56,81 @@ const TEST_CASES: &[(u32, u32)] = &[
 ];
 
 fn get_test_object(pyver: u32) -> Value {
-    let longish: i128 = 100000000000000000000;
-    let mut obj = pyobj!(d={
-        n=None           => n=None,
-        b=False          => t=(b=False, b=True),
-        i=10             => i=100000,
-        iii=longish       => iii=longish,
-        f=1.0            => f=1.0,
-        bb=b"bytes"      => bb=b"bytes",
-        s="string"       => s="string",
-        fs=(i=0, i=42)   => fs=(i=0, i=42),
-        t=(i=1, i=2)     => t=(i=1, i=2, i=3),
-        t=()             => l=[
-            l=[i=1, i=2, i=3],
-            ss=(i=0, i=42),
-            d={},
-            bb=b"\x00\x55\xaa\xff"
-        ]
-    });
-    // Unfortunately, __dict__ keys are strings and so are pickled
-    // differently depending on major version.
-    match &mut obj {
-        Value::Dict(map) => {
-            if pyver == 2 {
-                map.push((pyobj!(i = 7), pyobj!(d={bb=b"attr" => i=5})));
-            } else {
-                map.push((pyobj!(i = 7), pyobj!(d={s="attr" => i=5})));
-            }
-        }
-        _ => unreachable!(),
-    }
-    obj
+    Value::Dict(vec![
+        (
+            Value::Bool(false),
+            Value::Tuple(vec![Value::Bool(false), Value::Bool(true)]),
+        ),
+        (Value::F64(1.0), Value::F64(1.0)),
+        (
+            Value::I128(100000000000000000000),
+            Value::I128(100000000000000000000),
+        ),
+        (
+            Value::Int(7),
+            Value::Dict(vec![(Value::String("attr".to_string()), Value::Int(5))]),
+        ),
+        (Value::Int(10), Value::Int(100000)),
+        (
+            Value::Reduce(
+                Box::new(Value::Class(
+                    "__builtin__".to_string(),
+                    "frozenset".to_string(),
+                )),
+                Box::new(Value::Tuple(vec![Value::List(vec![
+                    Value::Int(0),
+                    Value::Int(42),
+                ])])),
+            ),
+            Value::Reduce(
+                Box::new(Value::Class(
+                    "__builtin__".to_string(),
+                    "frozenset".to_string(),
+                )),
+                Box::new(Value::Tuple(vec![Value::List(vec![
+                    Value::Int(0),
+                    Value::Int(42),
+                ])])),
+            ),
+        ),
+        (
+            Value::String("string".to_string()),
+            Value::String("string".to_string()),
+        ),
+        (
+            Value::Tuple(vec![Value::Int(1), Value::Int(2)]),
+            Value::Tuple(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+        ),
+        (Value::None, Value::None),
+        (
+            Value::String("bytes".to_string()),
+            Value::String("bytes".to_string()),
+        ),
+        (
+            Value::Tuple(vec![]),
+            Value::List(vec![
+                Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+                Value::Reduce(
+                    Box::new(Value::Class("__builtin__".to_string(), "set".to_string())),
+                    Box::new(Value::Tuple(vec![Value::List(vec![
+                        Value::Int(0),
+                        Value::Int(42),
+                    ])])),
+                ),
+                Value::Dict(vec![]),
+                Value::Reduce(
+                    Box::new(Value::Class(
+                        "__builtin__".to_string(),
+                        "bytearray".to_string(),
+                    )),
+                    Box::new(Value::Tuple(vec![
+                        Value::Bytes(vec![0, 85, 170, 255]),
+                        Value::String("latin-1".to_string()),
+                    ])),
+                ),
+            ]),
+        ),
+    ])
 }
 
 #[test]
