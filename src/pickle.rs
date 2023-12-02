@@ -176,6 +176,7 @@ impl Unpickler {
     }
 
     fn load_op(&mut self, op: u8, mut file: impl BufRead) -> Result<()> {
+        println!("op: {}", op);
         match op {
             MARK => self.load_mark(),
             POP => self.load_pop(),
@@ -431,7 +432,6 @@ impl Unpickler {
         buf.remove(buf.len() - 1); // remove the newline
 
         let value = self.parse_string(&buf);
-        print!("Unicode: {:?}, {:?}", buf, value);
         if let Ok(value) = value {
             self.stack.push(Value::String(value));
         } else {
@@ -444,13 +444,14 @@ impl Unpickler {
     fn load_binunicode(&mut self, mut file: impl BufRead) -> Result<()> {
         let mut buf = [0; 4];
         file.read_exact(&mut buf)?;
-
+        println!("buf data: {:?}", buf);
         let n = LittleEndian::read_u32(&buf) as usize;
         let mut buf = vec![0; n];
         file.read_exact(&mut buf)?;
 
-        let s = str::from_utf8(&buf).unwrap().trim().to_string();
-        self.stack.push(Value::String(s));
+        let value = self.decode_unicode(buf.clone())?;
+        self.stack.push(value);
+
         Ok(())
     }
 
@@ -657,6 +658,7 @@ impl Unpickler {
 
     fn load_tuple(&mut self) -> Result<()> {
         let items = self.pop_mark();
+        println!("tuple items: {:?}", items);
         self.stack.push(Value::Tuple(items));
         Ok(())
     }
@@ -827,6 +829,50 @@ impl Unpickler {
         } else {
             Err(Error::Syntax(ErrorCode::InvalidString))
         }
+    }
+
+    fn decode_unicode(&self, string: Vec<u8>) -> Result<Value> {
+        match String::from_utf8(string) {
+            Ok(v) => Ok(Value::String(v)),
+            Err(_) => Err(Error::Syntax(ErrorCode::StringNotUTF8)),
+        }
+    }
+
+    // Decode escaped Unicode strings. These are encoded with "raw-unicode-escape",
+    // which only knows the \uXXXX and \UYYYYYYYY escapes. The backslash is escaped
+    // in this way, too.
+    fn decode_escaped_unicode(&self, s: &[u8]) -> Result<Value> {
+        let mut result = String::with_capacity(s.len());
+        let mut iter = s.iter();
+        while let Some(&b) = iter.next() {
+            match b {
+                b'\\' => {
+                    let nescape = match iter.next() {
+                        Some(&b'u') => 4,
+                        Some(&b'U') => 8,
+                        _ => return self.error(ErrorCode::InvalidLiteral(s.into())),
+                    };
+                    let mut accum = 0;
+                    for _i in 0..nescape {
+                        accum *= 16;
+                        match iter.next().and_then(|&ch| (ch as char).to_digit(16)) {
+                            Some(v) => accum += v,
+                            None => return self.error(ErrorCode::InvalidLiteral(s.into())),
+                        }
+                    }
+                    match char::from_u32(accum) {
+                        Some(v) => result.push(v),
+                        None => return self.error(ErrorCode::InvalidLiteral(s.into())),
+                    }
+                }
+                _ => result.push(b as char),
+            }
+        }
+        Ok(Value::String(result))
+    }
+
+    fn error<T>(&self, reason: ErrorCode) -> Result<T> {
+        Err(Error::Eval(reason, 0))
     }
 }
 

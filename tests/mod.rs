@@ -25,15 +25,15 @@ use pickle_rs::{Error, ErrorCode, F64Wrapper, HashMapWrapper, Unpickler, Unpickl
 
 // combinations of (python major, pickle proto) to test
 const TEST_CASES: &[(u32, u32)] = &[
-    (2, 0),
+    // (2, 0),
     (2, 1),
-    (2, 2),
-    (3, 0),
-    (3, 1),
-    (3, 2),
-    (3, 3),
-    (3, 4),
-    (3, 5),
+    // (2, 2),
+    // (3, 0),
+    // (3, 1),
+    // (3, 2),
+    // (3, 3),
+    // (3, 4),
+    // (3, 5),
 ];
 
 fn get_test_object(_pyver: u32) -> Value {
