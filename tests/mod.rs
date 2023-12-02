@@ -21,26 +21,7 @@
 
 use std::{fs::File, io::BufReader};
 
-use pickle_rs::{Error, ErrorCode, Unpickler, UnpicklerOptions, Value};
-
-macro_rules! pyobj {
-    (n=None)     => { Value::None };
-    (b=True)     => { Value::Bool(true) };
-    (b=False)    => { Value::Bool(false) };
-    (i=$i:expr)  => { Value::Int($i) };
-    (ii=$i:expr) => { Value::I64($i) };
-    (iii=$i:expr) => { Value::I128($i) };
-    (f=$f:expr)  => { Value::F64($f) };
-    (bb=$b:expr) => { Value::Bytes($b.to_vec()) };
-    (s=$s:expr)  => { Value::String($s.into()) };
-    (t=($($m:ident=$v:tt),*))  => { Value::Tuple(vec![$(pyobj!($m=$v)),*]) };
-    (l=[$($m:ident=$v:tt),*])  => { Value::List(vec![$(pyobj!($m=$v)),*]) };
-    (ss=($($m:ident=$v:tt),*)) => { Value::Set(vec![$(pyobj!($m=$v)),*]) };
-    (fs=($($m:ident=$v:tt),*)) => { Value::FrozenSet(vec![$(pyobj!($m=$v)),*]) };
-    (d={$($km:ident=$kv:tt => $vm:ident=$vv:tt),*}) => {
-        Value::Dict(vec![$((pyobj!($km=$kv), pyobj!($vm=$vv))),*])
-    };
-}
+use pickle_rs::{Error, ErrorCode, F64Wrapper, HashMapWrapper, Unpickler, UnpicklerOptions, Value};
 
 // combinations of (python major, pickle proto) to test
 const TEST_CASES: &[(u32, u32)] = &[
@@ -55,82 +36,90 @@ const TEST_CASES: &[(u32, u32)] = &[
     (3, 5),
 ];
 
-fn get_test_object(pyver: u32) -> Value {
-    Value::Dict(vec![
-        (
-            Value::Bool(false),
-            Value::Tuple(vec![Value::Bool(false), Value::Bool(true)]),
-        ),
-        (Value::F64(1.0), Value::F64(1.0)),
-        (
-            Value::I128(100000000000000000000),
-            Value::I128(100000000000000000000),
-        ),
-        (
-            Value::Int(7),
-            Value::Dict(vec![(Value::String("attr".to_string()), Value::Int(5))]),
-        ),
-        (Value::Int(10), Value::Int(100000)),
-        (
-            Value::Reduce(
-                Box::new(Value::Class(
-                    "__builtin__".to_string(),
-                    "frozenset".to_string(),
-                )),
-                Box::new(Value::Tuple(vec![Value::List(vec![
-                    Value::Int(0),
-                    Value::Int(42),
-                ])])),
+fn get_test_object(_pyver: u32) -> Value {
+    Value::Dict(HashMapWrapper(
+        vec![
+            (
+                Value::Bool(false),
+                Value::Tuple(vec![Value::Bool(false), Value::Bool(true)]),
             ),
-            Value::Reduce(
-                Box::new(Value::Class(
-                    "__builtin__".to_string(),
-                    "frozenset".to_string(),
-                )),
-                Box::new(Value::Tuple(vec![Value::List(vec![
-                    Value::Int(0),
-                    Value::Int(42),
-                ])])),
+            (Value::F64(F64Wrapper(1.0)), Value::F64(F64Wrapper(1.0))),
+            (
+                Value::I128(100000000000000000000),
+                Value::I128(100000000000000000000),
             ),
-        ),
-        (
-            Value::String("string".to_string()),
-            Value::String("string".to_string()),
-        ),
-        (
-            Value::Tuple(vec![Value::Int(1), Value::Int(2)]),
-            Value::Tuple(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
-        ),
-        (Value::None, Value::None),
-        (
-            Value::String("bytes".to_string()),
-            Value::String("bytes".to_string()),
-        ),
-        (
-            Value::Tuple(vec![]),
-            Value::List(vec![
-                Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            (
+                Value::Int(7),
+                Value::Dict(HashMapWrapper(
+                    vec![(Value::String("attr".to_string()), Value::Int(5))]
+                        .into_iter()
+                        .collect(),
+                )),
+            ),
+            (Value::Int(10), Value::Int(100000)),
+            (
                 Value::Reduce(
-                    Box::new(Value::Class("__builtin__".to_string(), "set".to_string())),
+                    Box::new(Value::Class(
+                        "__builtin__".to_string(),
+                        "frozenset".to_string(),
+                    )),
                     Box::new(Value::Tuple(vec![Value::List(vec![
                         Value::Int(0),
                         Value::Int(42),
                     ])])),
                 ),
-                Value::Dict(vec![]),
                 Value::Reduce(
                     Box::new(Value::Class(
                         "__builtin__".to_string(),
-                        "bytearray".to_string(),
+                        "frozenset".to_string(),
                     )),
-                    Box::new(Value::Tuple(vec![
-                        Value::Bytes(vec![0, 85, 170, 255]),
-                        Value::String("latin-1".to_string()),
-                    ])),
+                    Box::new(Value::Tuple(vec![Value::List(vec![
+                        Value::Int(0),
+                        Value::Int(42),
+                    ])])),
                 ),
-            ]),
-        ),
-    ])
+            ),
+            (
+                Value::String("string".to_string()),
+                Value::String("string".to_string()),
+            ),
+            (
+                Value::Tuple(vec![Value::Int(1), Value::Int(2)]),
+                Value::Tuple(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            ),
+            (Value::None, Value::None),
+            (
+                Value::String("bytes".to_string()),
+                Value::String("bytes".to_string()),
+            ),
+            (
+                Value::Tuple(vec![]),
+                Value::List(vec![
+                    Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+                    Value::Reduce(
+                        Box::new(Value::Class("__builtin__".to_string(), "set".to_string())),
+                        Box::new(Value::Tuple(vec![Value::List(vec![
+                            Value::Int(0),
+                            Value::Int(42),
+                        ])])),
+                    ),
+                    Value::Dict(HashMapWrapper(vec![].into_iter().collect())),
+                    Value::Reduce(
+                        Box::new(Value::Class(
+                            "__builtin__".to_string(),
+                            "bytearray".to_string(),
+                        )),
+                        Box::new(Value::Tuple(vec![
+                            Value::Bytes(vec![0, 85, 170, 255]),
+                            Value::String("latin-1".to_string()),
+                        ])),
+                    ),
+                ]),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    ))
 }
 
 #[test]

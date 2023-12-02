@@ -18,9 +18,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::hash::Hash;
+
+use crate::{F64Wrapper, HashMapWrapper, HashSetWrapper};
+
 pub type MemoId = u32;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Hash)]
 pub enum Global {
     Set,       // builtins/__builtin__.set
     Frozenset, // builtins/__builtin__.frozenset
@@ -31,7 +35,7 @@ pub enum Global {
     Other,     // anything else (may be a classobj that is later discarded)
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Hash)]
 pub enum Value {
     MemoRef(MemoId),
     Global(Global),
@@ -40,16 +44,18 @@ pub enum Value {
     Int(i32),
     I64(i64),
     I128(i128),
-    F64(f64),
+    F64(F64Wrapper),
     Bytes(Vec<u8>),
     String(String),
     List(Vec<Value>),
     Tuple(Vec<Value>),
-    Set(Vec<Value>),
-    FrozenSet(Vec<Value>),
-    Dict(Vec<(Value, Value)>),
+    Set(HashSetWrapper<Value>),
+    FrozenSet(HashSetWrapper<Value>),
+    Dict(HashMapWrapper<Value, Value>),
     PersId(String),
     BinPersId(Box<Value>),
     Class(String, String),
     Reduce(Box<Value>, Box<Value>),
 }
+
+impl std::cmp::Eq for Value {}

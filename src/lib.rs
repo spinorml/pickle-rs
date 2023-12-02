@@ -21,7 +21,9 @@
 pub mod error;
 pub mod pickle;
 pub mod value;
+pub mod wrappers;
 
 pub use error::*;
 pub use pickle::*;
 pub use value::*;
+pub use wrappers::*;

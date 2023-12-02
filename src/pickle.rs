@@ -18,7 +18,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io::BufRead;
 use std::str;
@@ -27,7 +26,7 @@ use byteorder::{BigEndian, ByteOrder, LittleEndian};
 
 use crate::error::Result;
 use crate::value::Value;
-use crate::{Error, ErrorCode, MemoId};
+use crate::{Error, ErrorCode, F64Wrapper, HashMapWrapper, MemoId};
 
 const MARK: u8 = b'('; // push special markobject on stack
 const STOP: u8 = b'.'; // every pickle ends with STOP
@@ -287,7 +286,7 @@ impl Unpickler {
         let mut buf = String::new();
         file.read_line(&mut buf)?;
         let f = buf.trim().parse::<f64>()?;
-        self.stack.push(Value::F64(f));
+        self.stack.push(Value::F64(F64Wrapper(f)));
         Ok(())
     }
 
@@ -429,9 +428,10 @@ impl Unpickler {
     fn load_unicode(&mut self, mut file: impl BufRead) -> Result<()> {
         let mut buf = Vec::new();
         file.read_until(b'\n', &mut buf)?;
-
         buf.remove(buf.len() - 1); // remove the newline
+
         let value = self.parse_string(&buf);
+        print!("Unicode: {:?}, {:?}", buf, value);
         if let Ok(value) = value {
             self.stack.push(Value::String(value));
         } else {
@@ -514,19 +514,19 @@ impl Unpickler {
 
     fn load_dict(&mut self) -> Result<()> {
         let items = self.pop_mark();
-        let mut values = Vec::new();
+        let mut values = HashMap::new();
         for i in (0..items.len()).step_by(2) {
             let key = items[i].clone();
             let value = items[i + 1].clone();
-            values.push((key, value));
+            values.insert(key, value);
         }
 
-        self.stack.push(Value::Dict(values));
+        self.stack.push(Value::Dict(HashMapWrapper(values)));
         Ok(())
     }
 
     fn load_empty_dict(&mut self) -> Result<()> {
-        self.stack.push(Value::Dict(Vec::new()));
+        self.stack.push(Value::Dict(HashMapWrapper::new()));
         Ok(())
     }
 
@@ -554,6 +554,8 @@ impl Unpickler {
     fn load_get(&mut self, mut file: impl BufRead) -> Result<()> {
         let mut buf = Vec::new();
         file.read_until(b'\n', &mut buf)?;
+        buf.remove(buf.len() - 1); // remove the newline
+
         let memo_id = self.parse_string(&buf)?.parse::<MemoId>()?;
         let value = self
             .memo
@@ -646,7 +648,7 @@ impl Unpickler {
         let dict = self.stack.last_mut().unwrap();
         match dict {
             Value::Dict(dict) => {
-                dict.push((key, value));
+                dict.0.insert(key, value);
             }
             _ => unreachable!("Instead of Dict found: {:?}", dict),
         }
@@ -672,7 +674,7 @@ impl Unpickler {
                 for i in (0..items.len()).step_by(2) {
                     let key = items[i].clone();
                     let value = items[i + 1].clone();
-                    dict.push((key, value));
+                    dict.0.insert(key, value);
                 }
             }
             _ => unreachable!("Instead of Dict found: {:?}", dict),
@@ -684,7 +686,7 @@ impl Unpickler {
         let mut buf = [0; 8];
         file.read_exact(&mut buf)?;
         let value = BigEndian::read_f64(&buf);
-        self.stack.push(Value::F64(value));
+        self.stack.push(Value::F64(F64Wrapper(value)));
         Ok(())
     }
 
@@ -821,7 +823,7 @@ impl Unpickler {
 
     fn parse_string(&self, data: &[u8]) -> Result<String> {
         if let Ok(value) = str::from_utf8(data) {
-            Ok(value.trim().to_string())
+            Ok(value.to_string())
         } else {
             Err(Error::Syntax(ErrorCode::InvalidString))
         }
