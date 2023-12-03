@@ -18,15 +18,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
-use std::io::BufRead;
-use std::str;
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Read};
+use std::str::{self, FromStr};
 
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
+use num_bigint::{BigInt, Sign};
+use num_traits::ToPrimitive;
 
 use crate::error::Result;
-use crate::value::Value;
-use crate::{Error, ErrorCode, F64Wrapper, HashMapWrapper, MemoId};
+use crate::value::{Global, Value};
+use crate::{Error, ErrorCode, F64Wrapper, HashMapWrapper, HashSetWrapper, MemoId};
 
 const MARK: u8 = b'('; // push special markobject on stack
 const STOP: u8 = b'.'; // every pickle ends with STOP
@@ -115,6 +117,7 @@ pub struct UnpicklerOptions {
     fix_imports: bool,
     encoding: String,
     strict: bool,
+    decode_strings: bool,
 }
 
 impl Default for UnpicklerOptions {
@@ -123,719 +126,705 @@ impl Default for UnpicklerOptions {
             fix_imports: true,
             encoding: "ASCII".to_string(),
             strict: true,
+            decode_strings: true,
         }
     }
 }
 
-pub struct Unpickler {
+pub struct Unpickler<R: Read> {
     options: UnpicklerOptions,
+    reader: BufReader<R>,
     metastack: Vec<Vec<Value>>,
     stack: Vec<Value>,
-    memo: HashMap<MemoId, Value>,
-    proto: u8,
+    memo: HashMap<MemoId, (Value, i32)>,
+    pos: usize,
 }
 
-impl Unpickler {
-    pub fn new(options: UnpicklerOptions) -> Self {
+impl<R: Read> Unpickler<R> {
+    pub fn new(reader: R, options: UnpicklerOptions) -> Self {
         Self {
             options,
+            reader: BufReader::new(reader),
             metastack: Vec::new(),
             stack: Vec::new(),
             memo: HashMap::new(),
-            proto: 0,
+            pos: 0,
         }
     }
 
-    pub fn load(&mut self, mut file: impl BufRead) -> Result<Value> {
-        let mut buf = [0; 1];
-        let result;
+    /// Decodes a value from a `std::io::Read`.
+    pub fn value_from_reader(rdr: R, options: UnpicklerOptions) -> Result<Value> {
+        let mut unpickler = Unpickler::new(rdr, options);
+        let value = unpickler.deserialize_value()?;
+        unpickler.end()?;
+        Ok(value)
+    }
 
+    fn deserialize_value(&mut self) -> Result<Value> {
+        let internal_value = self.parse_value()?;
+        self.convert_value(internal_value)
+    }
+
+    fn parse_value(&mut self) -> Result<Value> {
         loop {
-            file.read_exact(&mut buf)?;
+            let byte = self.read_byte()?;
+            match byte {
+                // Specials
+                PROTO => {
+                    // Ignore this, as it is only important for instances (read
+                    // the version byte).
+                    self.read_byte()?;
+                }
+                FRAME => {
+                    // We'll ignore framing. But we still have to gobble up the length.
+                    self.read_fixed_8_bytes()?;
+                }
+                STOP => return self.pop(),
+                MARK => {
+                    let stack = std::mem::replace(&mut self.stack, Vec::with_capacity(128));
+                    self.metastack.push(stack);
+                }
+                POP => {
+                    if self.stack.is_empty() {
+                        self.pop_mark()?;
+                    } else {
+                        self.pop()?;
+                    }
+                }
+                POP_MARK => {
+                    self.pop_mark()?;
+                }
+                DUP => {
+                    let top = self.top()?.clone();
+                    self.stack.push(top);
+                }
 
-            let op = buf[0];
-            match op {
-                STOP => {
-                    result = self.load_stop();
-                    break;
+                // Memo saving ops
+                PUT => {
+                    let bytes = self.read_line()?;
+                    let memo_id = self.parse_ascii(bytes)?;
+                    self.memoize(memo_id)?;
                 }
-                _ => {
-                    self.load_op(op, &mut file)?;
+                BINPUT => {
+                    let memo_id = self.read_byte()?;
+                    self.memoize(memo_id.into())?;
                 }
+                LONG_BINPUT => {
+                    let bytes = self.read_fixed_4_bytes()?;
+                    let memo_id = LittleEndian::read_u32(&bytes);
+                    self.memoize(memo_id)?;
+                }
+                MEMOIZE => {
+                    let memo_id = self.memo.len();
+                    self.memoize(memo_id as MemoId)?;
+                }
+
+                // Memo getting ops
+                GET => {
+                    let bytes = self.read_line()?;
+                    let memo_id = self.parse_ascii(bytes)?;
+                    self.push_memo_ref(memo_id)?;
+                }
+                BINGET => {
+                    let memo_id = self.read_byte()?;
+                    self.push_memo_ref(memo_id.into())?;
+                }
+                LONG_BINGET => {
+                    let bytes = self.read_fixed_4_bytes()?;
+                    let memo_id = LittleEndian::read_u32(&bytes);
+                    self.push_memo_ref(memo_id)?;
+                }
+
+                // Singletons
+                NONE => self.stack.push(Value::None),
+                NEWFALSE => self.stack.push(Value::Bool(false)),
+                NEWTRUE => self.stack.push(Value::Bool(true)),
+
+                // ASCII-formatted numbers
+                INT => {
+                    let line = self.read_line()?;
+                    let val = self.decode_text_int(line)?;
+                    self.stack.push(val);
+                }
+                LONG => {
+                    let line = self.read_line()?;
+                    let long = self.decode_text_long(line)?;
+                    self.stack.push(long);
+                }
+                FLOAT => {
+                    let line = self.read_line()?;
+                    let f = F64Wrapper(self.parse_ascii(line)?);
+                    self.stack.push(Value::F64(f));
+                }
+
+                // ASCII-formatted strings
+                STRING => {
+                    let line = self.read_line()?;
+                    let string = self.decode_escaped_string(&line)?;
+                    self.stack.push(string);
+                }
+                UNICODE => {
+                    let line = self.read_line()?;
+                    let string = self.decode_escaped_unicode(&line)?;
+                    self.stack.push(string);
+                }
+
+                // Binary-coded numbers
+                BINFLOAT => {
+                    let bytes = self.read_fixed_8_bytes()?;
+                    self.stack
+                        .push(Value::F64(F64Wrapper(BigEndian::read_f64(&bytes))));
+                }
+                BININT => {
+                    let bytes = self.read_fixed_4_bytes()?;
+                    self.stack
+                        .push(Value::I64(LittleEndian::read_i32(&bytes).into()));
+                }
+                BININT1 => {
+                    let byte = self.read_byte()?;
+                    self.stack.push(Value::I64(byte.into()));
+                }
+                BININT2 => {
+                    let bytes = self.read_fixed_2_bytes()?;
+                    self.stack
+                        .push(Value::I64(LittleEndian::read_u16(&bytes).into()));
+                }
+                LONG1 => {
+                    let bytes = self.read_u8_prefixed_bytes()?;
+                    let long = self.decode_binary_long(bytes);
+                    self.stack.push(long);
+                }
+                LONG4 => {
+                    let bytes = self.read_i32_prefixed_bytes()?;
+                    let long = self.decode_binary_long(bytes);
+                    self.stack.push(long);
+                }
+
+                // Length-prefixed (byte)strings
+                SHORT_BINBYTES => {
+                    let string = self.read_u8_prefixed_bytes()?;
+                    self.stack.push(Value::Bytes(string));
+                }
+                BINBYTES => {
+                    let string = self.read_u32_prefixed_bytes()?;
+                    self.stack.push(Value::Bytes(string));
+                }
+                BINBYTES8 => {
+                    let string = self.read_u64_prefixed_bytes()?;
+                    self.stack.push(Value::Bytes(string));
+                }
+                SHORT_BINSTRING => {
+                    let string = self.read_u8_prefixed_bytes()?;
+                    let decoded = self.decode_string(string)?;
+                    self.stack.push(decoded);
+                }
+                BINSTRING => {
+                    let string = self.read_i32_prefixed_bytes()?;
+                    let decoded = self.decode_string(string)?;
+                    self.stack.push(decoded);
+                }
+                SHORT_BINUNICODE => {
+                    let string = self.read_u8_prefixed_bytes()?;
+                    let decoded = self.decode_unicode(string)?;
+                    self.stack.push(decoded);
+                }
+                BINUNICODE => {
+                    println!("BINUNICODE");
+                    let string = self.read_u32_prefixed_bytes()?;
+                    let decoded = self.decode_unicode(string)?;
+                    println!("BINUNICODE - decoded: {:?}", decoded);
+                    self.stack.push(decoded);
+                }
+                BINUNICODE8 => {
+                    let string = self.read_u64_prefixed_bytes()?;
+                    let decoded = self.decode_unicode(string)?;
+                    self.stack.push(decoded);
+                }
+                BYTEARRAY8 => {
+                    let string = self.read_u64_prefixed_bytes()?;
+                    self.stack.push(Value::Bytes(string));
+                }
+
+                // Tuples
+                EMPTY_TUPLE => self.stack.push(Value::Tuple(Vec::new())),
+                TUPLE1 => {
+                    let item = self.pop()?;
+                    self.stack.push(Value::Tuple(vec![item]));
+                }
+                TUPLE2 => {
+                    let item2 = self.pop()?;
+                    let item1 = self.pop()?;
+                    self.stack.push(Value::Tuple(vec![item1, item2]));
+                }
+                TUPLE3 => {
+                    let item3 = self.pop()?;
+                    let item2 = self.pop()?;
+                    let item1 = self.pop()?;
+                    self.stack.push(Value::Tuple(vec![item1, item2, item3]));
+                }
+                TUPLE => {
+                    let items = self.pop_mark()?;
+                    self.stack.push(Value::Tuple(items));
+                }
+
+                // Lists
+                EMPTY_LIST => self.stack.push(Value::List(Vec::new())),
+                LIST => {
+                    let items = self.pop_mark()?;
+                    self.stack.push(Value::List(items));
+                }
+                APPEND => {
+                    let value = self.pop()?;
+                    self.modify_list(|list| list.push(value))?;
+                }
+                APPENDS => {
+                    let items = self.pop_mark()?;
+                    self.modify_list(|list| list.extend(items))?;
+                }
+
+                // Dicts
+                EMPTY_DICT => self.stack.push(Value::Dict(HashMapWrapper(HashMap::new()))),
+                DICT => {
+                    let items = self.pop_mark()?;
+                    let mut dict = HashMap::with_capacity(items.len() / 2);
+                    for chunk in items.chunks_exact(2) {
+                        dict.insert(chunk[0].clone(), chunk[1].clone());
+                    }
+                    self.stack.push(Value::Dict(HashMapWrapper(dict)));
+                }
+                SETITEM => {
+                    let value = self.pop()?;
+                    let key = self.pop()?;
+                    self.modify_dict(|dict| {
+                        dict.insert(key, value);
+                    })?;
+                }
+                SETITEMS => {
+                    let items = self.pop_mark()?;
+                    self.modify_dict(|dict| {
+                        for chunk in items.chunks_exact(2) {
+                            dict.insert(chunk[0].clone(), chunk[1].clone());
+                        }
+                    })?;
+                }
+
+                // Sets and frozensets
+                EMPTY_SET => self.stack.push(Value::Set(HashSetWrapper(HashSet::new()))),
+                FROZENSET => {
+                    let items = self.pop_mark()?;
+                    self.stack.push(Value::FrozenSet(HashSetWrapper(
+                        items.into_iter().collect(),
+                    )));
+                }
+                ADDITEMS => {
+                    let items = self.pop_mark()?;
+                    self.modify_set(|set| set.extend(items))?;
+                }
+
+                // Arbitrary module globals, used here for unpickling set and frozenset
+                // from protocols < 4
+                GLOBAL => {
+                    let modname = self.read_line()?;
+                    let globname = self.read_line()?;
+                    let value = self.decode_global(modname, globname)?;
+                    self.stack.push(value);
+                }
+                STACK_GLOBAL => {
+                    let globname = match self.pop_resolve()? {
+                        Value::String(string) => string.into_bytes(),
+                        other => return Self::stack_error("string", &other, self.pos),
+                    };
+                    let modname = match self.pop_resolve()? {
+                        Value::String(string) => string.into_bytes(),
+                        other => return Self::stack_error("string", &other, self.pos),
+                    };
+                    let value = self.decode_global(modname, globname)?;
+                    self.stack.push(value);
+                }
+                REDUCE => {
+                    let argtuple = match self.pop_resolve()? {
+                        Value::Tuple(args) => args,
+                        other => return Self::stack_error("tuple", &other, self.pos),
+                    };
+                    let global = self.pop_resolve()?;
+                    self.reduce_global(global, argtuple)?;
+                }
+
+                // Arbitrary classes - make a best effort attempt to recover some data
+                INST => {
+                    // pop module name and class name
+                    for _ in 0..2 {
+                        self.read_line()?;
+                    }
+                    // pop arguments to init
+                    self.pop_mark()?;
+                    // push empty dictionary instead of the class instance
+                    self.stack.push(Value::Dict(HashMapWrapper(HashMap::new())));
+                }
+                OBJ => {
+                    // pop arguments to init
+                    self.pop_mark()?;
+                    // pop class object
+                    self.pop()?;
+                    self.stack.push(Value::Dict(HashMapWrapper(HashMap::new())));
+                }
+                NEWOBJ => {
+                    // pop arguments and class object
+                    for _ in 0..2 {
+                        self.pop()?;
+                    }
+                    self.stack.push(Value::Dict(HashMapWrapper(HashMap::new())));
+                }
+                NEWOBJ_EX => {
+                    // pop keyword args, arguments and class object
+                    for _ in 0..3 {
+                        self.pop()?;
+                    }
+                    self.stack.push(Value::Dict(HashMapWrapper(HashMap::new())));
+                }
+                BUILD => {
+                    // The top-of-stack for BUILD is used either as the instance __dict__,
+                    // or an argument for __setstate__, in which case it can be *any* type
+                    // of object.  In both cases, we just replace the standin.
+                    let state = self.pop()?;
+                    self.pop()?; // remove the object standin
+                    self.stack.push(state);
+                }
+
+                PERSID => {
+                    let line = self.read_line()?;
+                    println!("PERSID: {:?}", line);
+                    let bytes = Value::Bytes(line);
+                    self.stack.push(Value::BinPersId(Box::new(bytes)));
+                }
+
+                BINPERSID => {
+                    let binpers_id = self.pop()?;
+                    self.stack.push(Value::BinPersId(Box::new(binpers_id)));
+                }
+
+                // Unsupported opcodes
+                code => return self.error(ErrorCode::Unsupported(code as char)),
             }
         }
+    }
 
-        match result {
-            Some(result) => Ok(result),
-            None => Err(Error::Syntax(ErrorCode::EOFWhileParsing)),
+    // Pop the stack top item.
+    fn pop(&mut self) -> Result<Value> {
+        match self.stack.pop() {
+            Some(v) => Ok(v),
+            None => self.error(ErrorCode::StackUnderflow),
         }
     }
 
-    pub fn load_from_slice(&self, _file: &[u8]) -> Result<Value> {
-        todo!("Unpickler::load_from_slice")
-    }
-
-    fn load_op(&mut self, op: u8, mut file: impl BufRead) -> Result<()> {
-        println!("op: {}", op);
-        match op {
-            MARK => self.load_mark(),
-            POP => self.load_pop(),
-            POP_MARK => self.load_pop_mark(),
-            DUP => self.load_dup(),
-            FLOAT => self.load_float(&mut file),
-            INT => self.load_int(&mut file),
-            BININT => self.load_binint(&mut file),
-            BININT1 => self.load_binint1(&mut file),
-            LONG => self.load_long(&mut file),
-            BININT2 => self.load_binint2(&mut file),
-            NONE => self.load_none(),
-            PERSID => self.load_persid(&mut file),
-            BINPERSID => self.load_binpersid(),
-            REDUCE => self.load_reduce(),
-            STRING => self.load_string(&mut file),
-            BINSTRING => self.load_binstring(&mut file),
-            SHORT_BINSTRING => self.load_short_binstring(&mut file),
-            UNICODE => self.load_unicode(&mut file),
-            BINUNICODE => self.load_binunicode(&mut file),
-            APPEND => self.load_append(),
-            BUILD => self.load_build(),
-            GLOBAL => self.load_global(&mut file),
-            DICT => self.load_dict(),
-            EMPTY_DICT => self.load_empty_dict(),
-            APPENDS => self.load_appends(),
-            GET => self.load_get(&mut file),
-            BINGET => self.load_binget(&mut file),
-            INST => self.load_inst(),
-            LONG_BINGET => self.load_long_binget(),
-            LIST => self.load_list(),
-            EMPTY_LIST => self.load_empty_list(),
-            OBJ => self.load_obj(),
-            PUT => self.load_put(&mut file),
-            BINPUT => self.load_binput(&mut file),
-            LONG_BINPUT => self.load_long_binput(),
-            SETITEM => self.load_setitem(),
-            TUPLE => self.load_tuple(),
-            EMPTY_TUPLE => self.load_empty_tuple(),
-            SETITEMS => self.load_setitems(),
-            BINFLOAT => self.load_binfloat(&mut file),
-            PROTO => self.load_proto(&mut file),
-            NEWOBJ => self.load_newobj(),
-            EXT1 => self.load_ext1(),
-            EXT2 => self.load_ext2(),
-            EXT4 => self.load_ext4(),
-            TUPLE1 => self.load_tuple1(),
-            TUPLE2 => self.load_tuple2(),
-            TUPLE3 => self.load_tuple3(),
-            NEWTRUE => self.load_newtrue(),
-            NEWFALSE => self.load_newfalse(),
-            LONG1 => self.load_long1(),
-            LONG4 => self.load_long4(),
-            BINBYTES => self.load_binbytes(),
-            SHORT_BINBYTES => self.load_short_binbytes(),
-            SHORT_BINUNICODE => self.load_short_binunicode(),
-            BINUNICODE8 => self.load_binunicode8(),
-            BINBYTES8 => self.load_binbytes8(),
-            EMPTY_SET => self.load_empty_set(),
-            ADDITEMS => self.load_additems(),
-            FROZENSET => self.load_frozenset(),
-            NEWOBJ_EX => self.load_newobj_ex(),
-            STACK_GLOBAL => self.load_stack_global(),
-            MEMOIZE => self.load_memoize(),
-            FRAME => self.load_frame(),
-            BYTEARRAY8 => self.load_bytearray8(),
-            NEXT_BUFFER => self.load_next_buffer(),
-            READONLY_BUFFER => self.load_readonly_buffer(),
-            _ => unreachable!("Unspported op: {}", op as i32),
+    // Pop the stack top item, and resolve it if it is a memo reference.
+    fn pop_resolve(&mut self) -> Result<Value> {
+        let top = self.stack.pop();
+        match self.resolve(top) {
+            Some(v) => Ok(v),
+            None => self.error(ErrorCode::StackUnderflow),
         }
     }
 
-    fn load_mark(&mut self) -> Result<()> {
-        self.metastack.push(self.stack.clone());
-        self.stack.clear();
+    // Pop all topmost stack items until the next MARK.
+    fn pop_mark(&mut self) -> Result<Vec<Value>> {
+        match self.metastack.pop() {
+            Some(new) => Ok(std::mem::replace(&mut self.stack, new)),
+            None => self.error(ErrorCode::StackUnderflow),
+        }
+    }
+
+    // Mutably view the stack top item.
+    fn top(&mut self) -> Result<&mut Value> {
+        match self.stack.last_mut() {
+            // Since some operations like APPEND do things to the stack top, we
+            // need to provide the reference to the "real" object here, not the
+            // MemoRef variant.
+            Some(&mut Value::MemoRef(n)) => self
+                .memo
+                .get_mut(&n)
+                .map(|&mut (ref mut v, _)| v)
+                .ok_or_else(|| Error::Syntax(ErrorCode::MissingMemo(n))),
+            Some(other_value) => Ok(other_value),
+            None => Err(Error::Eval(ErrorCode::StackUnderflow, self.pos)),
+        }
+    }
+
+    // Pushes a memo reference on the stack, and increases the usage counter.
+    fn push_memo_ref(&mut self, memo_id: MemoId) -> Result<()> {
+        self.stack.push(Value::MemoRef(memo_id));
+        match self.memo.get_mut(&memo_id) {
+            Some(&mut (_, ref mut count)) => {
+                *count += 1;
+                Ok(())
+            }
+            None => Err(Error::Eval(ErrorCode::MissingMemo(memo_id), self.pos)),
+        }
+    }
+
+    // Memoize the current stack top with the given ID.  Moves the actual
+    // object into the memo, and saves a reference on the stack instead.
+    fn memoize(&mut self, memo_id: MemoId) -> Result<()> {
+        let mut item = self.pop()?;
+        if let Value::MemoRef(id) = item {
+            // TODO: is this even possible?
+            item = match self.memo.get(&id) {
+                Some((v, _)) => v.clone(),
+                None => return Err(Error::Eval(ErrorCode::MissingMemo(id), self.pos)),
+            };
+        }
+        self.memo.insert(memo_id, (item, 1));
+        self.stack.push(Value::MemoRef(memo_id));
         Ok(())
     }
 
-    fn load_stop(&mut self) -> Option<Value> {
-        self.stack.pop()
+    // Resolve memo reference during stream decoding.
+    fn resolve(&mut self, maybe_memo: Option<Value>) -> Option<Value> {
+        match maybe_memo {
+            Some(Value::MemoRef(id)) => {
+                self.memo.get_mut(&id).map(|&mut (ref val, ref mut count)| {
+                    // We can't remove it from the memo here, since we haven't
+                    // decoded the whole stream yet and there may be further
+                    // references to the value.
+                    *count -= 1;
+                    val.clone()
+                })
+            }
+            other => other,
+        }
     }
 
-    fn load_pop(&mut self) -> Result<()> {
-        if self.stack.is_empty() {
-            self.pop_mark();
+    // Resolve memo reference during Value deserializing.
+    fn resolve_recursive<T, U, F>(&mut self, id: MemoId, u: U, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut Self, U, Value) -> Result<T>,
+    {
+        // Take the value from the memo while visiting it.  This prevents us
+        // from trying to depickle recursive structures, which we can't do
+        // because our Values aren't references.
+        let (value, mut count) = match self.memo.remove(&id) {
+            Some(entry) => entry,
+            None => return Err(Error::Syntax(ErrorCode::Recursive)),
+        };
+        count -= 1;
+        if count <= 0 {
+            f(self, u, value)
+            // No need to put it back.
         } else {
-            self.stack.pop();
+            let result = f(self, u, value.clone());
+            self.memo.insert(id, (value, count));
+            result
         }
-        Ok(())
     }
 
-    fn load_pop_mark(&mut self) -> Result<()> {
-        self.pop_mark();
-        Ok(())
+    /// Assert that we reached the end of the stream.
+    fn end(&mut self) -> Result<()> {
+        let mut buf = [0];
+        match self.reader.read(&mut buf) {
+            Err(err) => Err(Error::Io(err)),
+            Ok(1) => self.error(ErrorCode::TrailingBytes),
+            _ => Ok(()),
+        }
     }
 
-    fn load_dup(&mut self) -> Result<()> {
-        let value = self
-            .stack
-            .last()
-            .ok_or_else(|| Error::Syntax(ErrorCode::StackUnderflow))?
-            .clone();
-        self.stack.push(value);
-        Ok(())
+    fn read_line(&mut self) -> Result<Vec<u8>> {
+        let mut buf = Vec::with_capacity(16);
+        match self.reader.read_until(b'\n', &mut buf) {
+            Ok(_) => {
+                self.pos += buf.len();
+                buf.pop(); // remove newline
+                if buf.last() == Some(&b'\r') {
+                    buf.pop();
+                }
+                Ok(buf)
+            }
+            Err(err) => Err(Error::Io(err)),
+        }
     }
 
-    fn load_float(&mut self, mut file: impl BufRead) -> Result<()> {
-        let mut buf = String::new();
-        file.read_line(&mut buf)?;
-        let f = buf.trim().parse::<f64>()?;
-        self.stack.push(Value::F64(F64Wrapper(f)));
-        Ok(())
+    #[inline]
+    fn read_byte(&mut self) -> Result<u8> {
+        let mut buf = [0];
+        match self.reader.read(&mut buf) {
+            Ok(1) => {
+                self.pos += 1;
+                Ok(buf[0])
+            }
+            Ok(_) => self.error(ErrorCode::EOFWhileParsing),
+            Err(err) => Err(Error::Io(err)),
+        }
     }
 
-    fn load_int(&mut self, mut file: impl BufRead) -> Result<()> {
+    #[inline]
+    fn read_bytes(&mut self, n: usize) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
-        file.read_until(b'\n', &mut buf)?;
-        buf.remove(buf.len() - 1); // remove the newline
-        let value = self.parse_string(&buf)?;
-
-        if value == TRUE {
-            self.stack.push(Value::Bool(true));
-        } else if value == FALSE {
-            self.stack.push(Value::Bool(false));
-        } else {
-            let i = value.parse::<i32>()?;
-            self.stack.push(Value::Int(i));
+        match self.reader.by_ref().take(n as u64).read_to_end(&mut buf) {
+            Ok(m) if n == m => {
+                self.pos += n;
+                Ok(buf)
+            }
+            Ok(_) => self.error(ErrorCode::EOFWhileParsing),
+            Err(err) => Err(Error::Io(err)),
         }
-
-        Ok(())
     }
 
-    fn load_binint(&mut self, mut file: impl BufRead) -> Result<()> {
-        let mut buf = [0; 4];
-        file.read_exact(&mut buf)?;
-
-        let value = LittleEndian::read_i32(&buf);
-        self.stack.push(Value::Int(value));
-        Ok(())
-    }
-
-    fn load_binint1(&mut self, mut file: impl BufRead) -> Result<()> {
-        let mut buf = [0; 1];
-        file.read_exact(&mut buf)?;
-        let value = buf[0] as i32;
-        self.stack.push(Value::Int(value));
-        Ok(())
-    }
-
-    fn load_long(&mut self, mut file: impl BufRead) -> Result<()> {
-        let mut buf = String::new();
-        file.read_line(&mut buf)?;
-
-        let buf = buf.trim().trim_end_matches('L');
-        let value = buf.parse::<i128>()?;
-        self.stack.push(Value::I128(value));
-        Ok(())
-    }
-
-    fn load_binint2(&mut self, mut file: impl BufRead) -> Result<()> {
+    #[inline]
+    fn read_fixed_2_bytes(&mut self) -> Result<[u8; 2]> {
         let mut buf = [0; 2];
-        file.read_exact(&mut buf)?;
-
-        let value = LittleEndian::read_u16(&buf);
-        self.stack.push(Value::Int(value as i32));
-        todo!("Unpickler::load_binint2")
-    }
-
-    fn load_none(&mut self) -> Result<()> {
-        self.stack.push(Value::None);
-        Ok(())
-    }
-
-    fn load_persid(&mut self, mut file: impl BufRead) -> Result<()> {
-        let mut buf = String::new();
-        file.read_line(&mut buf)?;
-        self.stack.push(Value::PersId(buf));
-        Ok(())
-    }
-
-    fn load_binpersid(&mut self) -> Result<()> {
-        let value = self
-            .stack
-            .pop()
-            .ok_or_else(|| Error::Syntax(ErrorCode::StackUnderflow))?;
-
-        self.stack.push(Value::BinPersId(Box::new(value)));
-        Ok(())
-    }
-
-    fn load_reduce(&mut self) -> Result<()> {
-        let args = self.stack.pop().ok_or_else(|| {
-            Error::Syntax(ErrorCode::InvalidStackTop(
-                "reduce: expected args on stack",
-                "nothing".to_string(),
-            ))
-        })?;
-
-        let func = self.stack.pop().ok_or_else(|| {
-            Error::Syntax(ErrorCode::InvalidStackTop(
-                "reduce: expected func on stack",
-                "nothing".to_string(),
-            ))
-        })?;
-
-        self.stack
-            .push(Value::Reduce(Box::new(func), Box::new(args)));
-        Ok(())
-    }
-
-    fn load_string(&mut self, mut file: impl BufRead) -> Result<()> {
-        let mut buf = Vec::new();
-        file.read_until(b'\n', &mut buf)?;
-
-        if buf.len() > 2 && buf[0] == b'\'' && buf[0] == buf[buf.len() - 2] {
-            let s = self.parse_string(buf[1..buf.len() - 2].as_ref())?;
-            self.stack.push(Value::String(s));
-            Ok(())
-        } else {
-            Err(Error::Syntax(ErrorCode::InvalidString))
-        }
-    }
-
-    fn load_binstring(&mut self, mut file: impl BufRead) -> Result<()> {
-        let mut buf = [0; 4];
-        file.read_exact(&mut buf)?;
-
-        let len = LittleEndian::read_i32(&buf) as usize;
-        let mut buf = vec![0; len];
-        file.read_exact(&mut buf)?;
-
-        let s = self.parse_string(&buf)?;
-        self.stack.push(Value::String(s));
-        Ok(())
-    }
-
-    fn load_short_binstring(&mut self, mut file: impl BufRead) -> Result<()> {
-        let mut buf = [0; 1];
-        file.read_exact(&mut buf)?;
-
-        let len = buf[0] as usize;
-        let mut buf = vec![0; len];
-        file.read_exact(&mut buf)?;
-
-        let s = self.parse_string(&buf)?;
-        self.stack.push(Value::String(s));
-        Ok(())
-    }
-
-    fn load_unicode(&mut self, mut file: impl BufRead) -> Result<()> {
-        let mut buf = Vec::new();
-        file.read_until(b'\n', &mut buf)?;
-        buf.remove(buf.len() - 1); // remove the newline
-
-        let value = self.parse_string(&buf);
-        if let Ok(value) = value {
-            self.stack.push(Value::String(value));
-        } else {
-            self.stack.push(Value::Bytes(buf))
-        }
-
-        Ok(())
-    }
-
-    fn load_binunicode(&mut self, mut file: impl BufRead) -> Result<()> {
-        let mut buf = [0; 4];
-        file.read_exact(&mut buf)?;
-        println!("buf data: {:?}", buf);
-        let n = LittleEndian::read_u32(&buf) as usize;
-        let mut buf = vec![0; n];
-        file.read_exact(&mut buf)?;
-
-        let value = self.decode_unicode(buf.clone())?;
-        self.stack.push(value);
-
-        Ok(())
-    }
-
-    fn load_append(&mut self) -> Result<()> {
-        let value = self
-            .stack
-            .pop()
-            .ok_or_else(|| Error::Syntax(ErrorCode::StackUnderflow))?;
-
-        let list = self
-            .stack
-            .last_mut()
-            .ok_or_else(|| Error::Syntax(ErrorCode::StackUnderflow))?;
-
-        match list {
-            Value::List(ref mut l) => {
-                l.push(value);
-                Ok(())
+        match self.reader.by_ref().take(2).read_exact(&mut buf) {
+            Ok(()) => {
+                self.pos += 2;
+                Ok(buf)
             }
-            _ => Err(Error::Syntax(ErrorCode::InvalidValue(format!(
-                "Expected list on stack but found {:?}",
-                list
-            )))),
-        }
-    }
-
-    fn load_build(&mut self) -> Result<()> {
-        // The top-of-stack for BUILD is used either as the instance __dict__,
-        // or an argument for __setstate__, in which case it can be *any* type
-        // of object.  In both cases, we just replace the standin.
-        let state = self.stack.pop().ok_or_else(|| {
-            Error::Syntax(ErrorCode::InvalidStackTop(
-                "build: expected state on stack",
-                "nothing".to_string(),
-            ))
-        })?;
-
-        self.stack.pop().ok_or_else(|| {
-            Error::Syntax(ErrorCode::InvalidStackTop(
-                "build: expected class on stack",
-                "nothing".to_string(),
-            ))
-        })?; // remove the object standin
-
-        self.stack.push(state);
-        Ok(())
-    }
-
-    fn load_global(&mut self, mut file: impl BufRead) -> Result<()> {
-        let mut module = String::new();
-        file.read_line(&mut module)?;
-        let module = module.trim().to_string();
-
-        let mut name = String::new();
-        file.read_line(&mut name)?;
-        let name = name.trim().to_string();
-
-        self.stack.push(Value::Class(module, name));
-        Ok(())
-    }
-
-    fn load_dict(&mut self) -> Result<()> {
-        let items = self.pop_mark();
-        let mut values = HashMap::new();
-        for i in (0..items.len()).step_by(2) {
-            let key = items[i].clone();
-            let value = items[i + 1].clone();
-            values.insert(key, value);
-        }
-
-        self.stack.push(Value::Dict(HashMapWrapper(values)));
-        Ok(())
-    }
-
-    fn load_empty_dict(&mut self) -> Result<()> {
-        self.stack.push(Value::Dict(HashMapWrapper::new()));
-        Ok(())
-    }
-
-    fn load_appends(&mut self) -> Result<()> {
-        let items = self.pop_mark();
-        let list = self
-            .stack
-            .last_mut()
-            .ok_or_else(|| Error::Syntax(ErrorCode::StackUnderflow))?;
-
-        match list {
-            Value::List(ref mut l) => {
-                for item in items {
-                    l.push(item);
-                }
-                Ok(())
-            }
-            _ => Err(Error::Syntax(ErrorCode::InvalidValue(format!(
-                "Expected list on stack but found {:?}",
-                list
-            )))),
-        }
-    }
-
-    fn load_get(&mut self, mut file: impl BufRead) -> Result<()> {
-        let mut buf = Vec::new();
-        file.read_until(b'\n', &mut buf)?;
-        buf.remove(buf.len() - 1); // remove the newline
-
-        let memo_id = self.parse_string(&buf)?.parse::<MemoId>()?;
-        let value = self
-            .memo
-            .get(&memo_id)
-            .ok_or_else(|| Error::Syntax(ErrorCode::MissingMemo(memo_id)))?
-            .clone();
-        self.stack.push(value);
-        Ok(())
-    }
-
-    fn load_binget(&mut self, mut file: impl BufRead) -> Result<()> {
-        let mut buf = [0; 1];
-        file.read_exact(&mut buf)?;
-        let memo_id = buf[0] as MemoId;
-        let value = self
-            .memo
-            .get(&memo_id)
-            .ok_or_else(|| Error::Syntax(ErrorCode::MissingMemo(memo_id)))?
-            .clone();
-        self.stack.push(value);
-        Ok(())
-    }
-
-    fn load_inst(&self) -> Result<()> {
-        todo!("Unpickler::load_inst")
-    }
-
-    fn load_long_binget(&self) -> Result<()> {
-        todo!("Unpickler::load_long_binget")
-    }
-
-    fn load_list(&mut self) -> Result<()> {
-        let items = self.pop_mark();
-        self.stack.push(Value::List(items));
-        Ok(())
-    }
-
-    fn load_empty_list(&mut self) -> Result<()> {
-        self.stack.push(Value::List(Vec::new()));
-        Ok(())
-    }
-
-    fn load_obj(&self) -> Result<()> {
-        todo!("Unpickler::load_obj")
-    }
-
-    fn load_put(&mut self, mut file: impl BufRead) -> Result<()> {
-        // i = int(self.readline()[:-1])
-        // if i < 0:
-        //     raise ValueError("negative PUT argument")
-        // self.memo[i] = self.stack[-1]
-        let mut buf = Vec::new();
-        file.read_until(b'\n', &mut buf)?;
-        let memo_id: i32 = String::from_utf8(buf)?.trim().parse()?;
-        if memo_id < 0 {
-            return Err(Error::Syntax(ErrorCode::InvalidValue(
-                "negative PUT argument".to_string(),
-            )));
-        }
-        let value = self
-            .stack
-            .last()
-            .ok_or_else(|| Error::Syntax(ErrorCode::StackUnderflow))?
-            .clone();
-
-        self.memo.insert(memo_id as MemoId, value);
-        Ok(())
-    }
-
-    fn load_binput(&mut self, mut file: impl BufRead) -> Result<()> {
-        let mut buf = [0; 1];
-        file.read_exact(&mut buf)?;
-        let memo_id = buf[0] as MemoId;
-        let value = self
-            .stack
-            .last()
-            .ok_or_else(|| Error::Syntax(ErrorCode::StackUnderflow))?
-            .clone();
-        self.memo.insert(memo_id, value);
-        Ok(())
-    }
-
-    fn load_long_binput(&self) -> Result<()> {
-        todo!("Unpickler::load_long_binput")
-    }
-
-    fn load_setitem(&mut self) -> Result<()> {
-        let value = self.stack.pop().unwrap();
-        let key = self.stack.pop().unwrap();
-        let dict = self.stack.last_mut().unwrap();
-        match dict {
-            Value::Dict(dict) => {
-                dict.0.insert(key, value);
-            }
-            _ => unreachable!("Instead of Dict found: {:?}", dict),
-        }
-        Ok(())
-    }
-
-    fn load_tuple(&mut self) -> Result<()> {
-        let items = self.pop_mark();
-        println!("tuple items: {:?}", items);
-        self.stack.push(Value::Tuple(items));
-        Ok(())
-    }
-
-    fn load_empty_tuple(&mut self) -> Result<()> {
-        self.stack.push(Value::Tuple(Vec::new()));
-        Ok(())
-    }
-
-    fn load_setitems(&mut self) -> Result<()> {
-        let items = self.pop_mark();
-        let dict = self.stack.last_mut().unwrap();
-        match dict {
-            Value::Dict(dict) => {
-                for i in (0..items.len()).step_by(2) {
-                    let key = items[i].clone();
-                    let value = items[i + 1].clone();
-                    dict.0.insert(key, value);
+            Err(err) => {
+                if err.kind() == std::io::ErrorKind::UnexpectedEof {
+                    self.error(ErrorCode::EOFWhileParsing)
+                } else {
+                    Err(Error::Io(err))
                 }
             }
-            _ => unreachable!("Instead of Dict found: {:?}", dict),
         }
-        Ok(())
     }
 
-    fn load_binfloat(&mut self, mut file: impl BufRead) -> Result<()> {
+    #[inline]
+    fn read_fixed_4_bytes(&mut self) -> Result<[u8; 4]> {
+        let mut buf = [0; 4];
+        match self.reader.by_ref().take(4).read_exact(&mut buf) {
+            Ok(()) => {
+                self.pos += 4;
+                Ok(buf)
+            }
+            Err(err) => {
+                if err.kind() == std::io::ErrorKind::UnexpectedEof {
+                    self.error(ErrorCode::EOFWhileParsing)
+                } else {
+                    Err(Error::Io(err))
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn read_fixed_8_bytes(&mut self) -> Result<[u8; 8]> {
         let mut buf = [0; 8];
-        file.read_exact(&mut buf)?;
-        let value = BigEndian::read_f64(&buf);
-        self.stack.push(Value::F64(F64Wrapper(value)));
-        Ok(())
+        match self.reader.by_ref().take(8).read_exact(&mut buf) {
+            Ok(()) => {
+                self.pos += 8;
+                Ok(buf)
+            }
+            Err(err) => {
+                if err.kind() == std::io::ErrorKind::UnexpectedEof {
+                    self.error(ErrorCode::EOFWhileParsing)
+                } else {
+                    Err(Error::Io(err))
+                }
+            }
+        }
     }
 
-    fn load_proto(&mut self, mut file: impl BufRead) -> Result<()> {
-        // proto = self.read(1)[0]
-        // if not 0 <= proto <= HIGHEST_PROTOCOL:
-        //     raise ValueError("unsupported pickle protocol: %d" % proto)
-        // self.proto = proto
-        const HIGHEST_PROTOCOL: u8 = 5;
+    fn read_i32_prefixed_bytes(&mut self) -> Result<Vec<u8>> {
+        let lenbytes = self.read_fixed_4_bytes()?;
+        match LittleEndian::read_i32(&lenbytes) {
+            0 => Ok(vec![]),
+            l if l < 0 => self.error(ErrorCode::NegativeLength),
+            l => self.read_bytes(l as usize),
+        }
+    }
 
-        let mut buf = [0; 1];
-        file.read_exact(&mut buf)?;
-        let proto = buf[0];
+    fn read_u64_prefixed_bytes(&mut self) -> Result<Vec<u8>> {
+        let lenbytes = self.read_fixed_8_bytes()?;
+        self.read_bytes(LittleEndian::read_u64(&lenbytes) as usize)
+    }
 
-        if (0..=HIGHEST_PROTOCOL).contains(&proto) {
-            self.proto = proto;
+    fn read_u32_prefixed_bytes(&mut self) -> Result<Vec<u8>> {
+        let lenbytes = self.read_fixed_4_bytes()?;
+        println!("read_u32_prefixed_bytes - lenbytes: {:?}", lenbytes);
+        self.read_bytes(LittleEndian::read_u32(&lenbytes) as usize)
+    }
+
+    fn read_u8_prefixed_bytes(&mut self) -> Result<Vec<u8>> {
+        let lenbyte = self.read_byte()?;
+        println!("read_u8_prefixed_bytes - lenbyte: {}", lenbyte);
+        self.read_bytes(lenbyte as usize)
+    }
+
+    // Parse an expected ASCII literal from the stream or raise an error.
+    fn parse_ascii<T: FromStr>(&self, bytes: Vec<u8>) -> Result<T> {
+        match str::from_utf8(&bytes).unwrap_or("").parse() {
+            Ok(v) => Ok(v),
+            Err(_) => self.error(ErrorCode::InvalidLiteral(bytes)),
+        }
+    }
+
+    // Decode a text-encoded integer.
+    fn decode_text_int(&self, line: Vec<u8>) -> Result<Value> {
+        // Handle protocol 1 way of spelling true/false
+        Ok(if line == b"00" {
+            Value::Bool(false)
+        } else if line == b"01" {
+            Value::Bool(true)
         } else {
-            return Err(Error::Syntax(ErrorCode::InvalidValue(
-                "unsupported pickle protocol".to_string(),
-            )));
+            let i = self.parse_ascii(line)?;
+            Value::I64(i)
+        })
+    }
+
+    // Decode a text-encoded long integer.
+    fn decode_text_long(&self, mut line: Vec<u8>) -> Result<Value> {
+        // Remove "L" suffix.
+        if line.last() == Some(&b'L') {
+            line.pop();
         }
-        Ok(())
+        match BigInt::parse_bytes(&line, 10) {
+            Some(i) => Ok(Value::Int(i)),
+            None => self.error(ErrorCode::InvalidLiteral(line)),
+        }
     }
 
-    fn load_newobj(&self) -> Result<()> {
-        todo!("Unpickler::load_newobj")
-    }
-
-    fn load_ext1(&self) -> Result<()> {
-        todo!("Unpickler::load_ext1")
-    }
-
-    fn load_ext2(&self) -> Result<()> {
-        todo!("Unpickler::load_ext2")
-    }
-
-    fn load_ext4(&self) -> Result<()> {
-        todo!("Unpickler::load_ext4")
-    }
-
-    fn load_tuple1(&self) -> Result<()> {
-        todo!("Unpickler::load_tuple1")
-    }
-
-    fn load_tuple2(&self) -> Result<()> {
-        todo!("Unpickler::load_tuple2")
-    }
-
-    fn load_tuple3(&self) -> Result<()> {
-        todo!("Unpickler::load_tuple3")
-    }
-
-    fn load_newtrue(&self) -> Result<()> {
-        todo!("Unpickler::load_newtrue")
-    }
-
-    fn load_newfalse(&self) -> Result<()> {
-        todo!("Unpickler::load_newfalse")
-    }
-
-    fn load_long1(&self) -> Result<()> {
-        todo!("Unpickler::load_long1")
-    }
-
-    fn load_long4(&self) -> Result<()> {
-        todo!("Unpickler::load_long4")
-    }
-
-    fn load_binbytes(&self) -> Result<()> {
-        todo!("Unpickler::load_binbytes")
-    }
-
-    fn load_short_binbytes(&self) -> Result<()> {
-        todo!("Unpickler::load_short_binbytes")
-    }
-
-    fn load_short_binunicode(&self) -> Result<()> {
-        todo!("Unpickler::load_short_binunicode")
-    }
-
-    fn load_binunicode8(&self) -> Result<()> {
-        todo!("Unpickler::load_binunicode8")
-    }
-
-    fn load_binbytes8(&self) -> Result<()> {
-        todo!("Unpickler::load_binbytes8")
-    }
-
-    fn load_empty_set(&self) -> Result<()> {
-        todo!("Unpickler::load_empty_set")
-    }
-
-    fn load_additems(&self) -> Result<()> {
-        todo!("Unpickler::load_additems")
-    }
-
-    fn load_frozenset(&self) -> Result<()> {
-        todo!("Unpickler::load_frozenset")
-    }
-
-    fn load_newobj_ex(&self) -> Result<()> {
-        todo!("Unpickler::load_newobj_ex")
-    }
-
-    fn load_stack_global(&self) -> Result<()> {
-        todo!("Unpickler::load_stack_global")
-    }
-
-    fn load_memoize(&self) -> Result<()> {
-        todo!("Unpickler::load_memoize")
-    }
-
-    fn load_frame(&self) -> Result<()> {
-        todo!("Unpickler::load_frame")
-    }
-
-    fn load_bytearray8(&self) -> Result<()> {
-        todo!("Unpickler::load_bytearray8")
-    }
-
-    fn load_next_buffer(&self) -> Result<()> {
-        todo!("Unpickler::load_next_buffer")
-    }
-
-    fn load_readonly_buffer(&self) -> Result<()> {
-        todo!("Unpickler::load_readonly_buffer")
-    }
-
-    fn pop_mark(&mut self) -> Vec<Value> {
-        let items = self.stack.clone();
-        self.stack = self.metastack.pop().unwrap();
-        items
-    }
-
-    fn parse_string(&self, data: &[u8]) -> Result<String> {
-        if let Ok(value) = str::from_utf8(data) {
-            Ok(value.to_string())
+    // Decode an escaped string.  These are encoded with "normal" Python string
+    // escape rules.
+    fn decode_escaped_string(&self, slice: &[u8]) -> Result<Value> {
+        // Remove quotes if they appear.
+        let slice = if (slice.len() >= 2)
+            && (slice[0] == slice[slice.len() - 1])
+            && (slice[0] == b'"' || slice[0] == b'\'')
+        {
+            &slice[1..slice.len() - 1]
         } else {
-            Err(Error::Syntax(ErrorCode::InvalidString))
+            slice
+        };
+        let mut result = Vec::with_capacity(slice.len());
+        let mut iter = slice.iter();
+        while let Some(&b) = iter.next() {
+            match b {
+                b'\\' => match iter.next() {
+                    Some(&b'\\') => result.push(b'\\'),
+                    Some(&b'a') => result.push(b'\x07'),
+                    Some(&b'b') => result.push(b'\x08'),
+                    Some(&b't') => result.push(b'\x09'),
+                    Some(&b'n') => result.push(b'\x0a'),
+                    Some(&b'v') => result.push(b'\x0b'),
+                    Some(&b'f') => result.push(b'\x0c'),
+                    Some(&b'r') => result.push(b'\x0d'),
+                    Some(&b'x') => {
+                        match iter
+                            .next()
+                            .and_then(|&ch1| (ch1 as char).to_digit(16))
+                            .and_then(|v1| {
+                                iter.next()
+                                    .and_then(|&ch2| (ch2 as char).to_digit(16))
+                                    .map(|v2| 16 * (v1 as u8) + (v2 as u8))
+                            }) {
+                            Some(v) => result.push(v),
+                            None => return self.error(ErrorCode::InvalidLiteral(slice.into())),
+                        }
+                    }
+                    _ => return self.error(ErrorCode::InvalidLiteral(slice.into())),
+                },
+                _ => result.push(b),
+            }
         }
-    }
-
-    fn decode_unicode(&self, string: Vec<u8>) -> Result<Value> {
-        match String::from_utf8(string) {
-            Ok(v) => Ok(Value::String(v)),
-            Err(_) => Err(Error::Syntax(ErrorCode::StringNotUTF8)),
-        }
+        self.decode_string(result)
     }
 
     // Decode escaped Unicode strings. These are encoded with "raw-unicode-escape",
@@ -871,691 +860,251 @@ impl Unpickler {
         Ok(Value::String(result))
     }
 
+    // Decode a string - either as Unicode or as bytes.
+    fn decode_string(&self, string: Vec<u8>) -> Result<Value> {
+        if self.options.decode_strings {
+            self.decode_unicode(string)
+        } else {
+            Ok(Value::Bytes(string))
+        }
+    }
+
+    // Decode a Unicode string from UTF-8.
+    fn decode_unicode(&self, string: Vec<u8>) -> Result<Value> {
+        match String::from_utf8(string) {
+            Ok(v) => Ok(Value::String(v)),
+            Err(_) => self.error(ErrorCode::StringNotUTF8),
+        }
+    }
+
+    // Decode a binary-encoded long integer.
+    fn decode_binary_long(&self, bytes: Vec<u8>) -> Value {
+        // BigInt::from_bytes_le doesn't like a sign bit in the bytes, therefore
+        // we have to extract that ourselves and do the two-s complement.
+        let negative = !bytes.is_empty() && (bytes[bytes.len() - 1] & 0x80 != 0);
+        let mut val = BigInt::from_bytes_le(Sign::Plus, &bytes);
+        if negative {
+            val -= BigInt::from(1) << (bytes.len() * 8);
+        }
+        Value::Int(val)
+    }
+
+    // Modify the stack-top list.
+    fn modify_list<F>(&mut self, f: F) -> Result<()>
+    where
+        F: FnOnce(&mut Vec<Value>),
+    {
+        let pos = self.pos;
+        let top = self.top()?;
+        if let Value::List(ref mut list) = *top {
+            f(list);
+            Ok(())
+        } else {
+            Self::stack_error("list", top, pos)
+        }
+    }
+
+    // Push items from a (key, value, key, value) flattened list onto a (key, value) vec.
+    fn extend_dict(dict: &mut Vec<(Value, Value)>, items: Vec<Value>) {
+        let mut key = None;
+        for value in items {
+            match key.take() {
+                None => key = Some(value),
+                Some(key) => dict.push((key, value)),
+            }
+        }
+    }
+
+    // Modify the stack-top dict.
+    fn modify_dict<F>(&mut self, f: F) -> Result<()>
+    where
+        F: FnOnce(&mut HashMap<Value, Value>),
+    {
+        let pos = self.pos;
+        let top = self.top()?;
+        if let Value::Dict(ref mut dict) = *top {
+            f(&mut dict.0);
+            Ok(())
+        } else {
+            Self::stack_error("dict", top, pos)
+        }
+    }
+
+    // Modify the stack-top set.
+    fn modify_set<F>(&mut self, f: F) -> Result<()>
+    where
+        F: FnOnce(&mut HashSet<Value>),
+    {
+        let pos = self.pos;
+        let top = self.top()?;
+        if let Value::Set(ref mut set) = *top {
+            f(&mut set.0);
+            Ok(())
+        } else {
+            Self::stack_error("set", top, pos)
+        }
+    }
+
+    // Push the Value::Global referenced by modname and globname.
+    fn decode_global(&mut self, modname: Vec<u8>, globname: Vec<u8>) -> Result<Value> {
+        let value = match (&*modname, &*globname) {
+            (b"_codecs", b"encode") => Value::Global(Global::Encode),
+            (b"__builtin__", b"set") | (b"builtins", b"set") => Value::Global(Global::Set),
+            (b"__builtin__", b"frozenset") | (b"builtins", b"frozenset") => {
+                Value::Global(Global::Frozenset)
+            }
+            (b"__builtin__", b"list") | (b"builtins", b"list") => Value::Global(Global::List),
+            (b"__builtin__", b"bytearray") | (b"builtins", b"bytearray") => {
+                Value::Global(Global::Bytearray)
+            }
+            (b"__builtin__", b"int") | (b"builtins", b"int") => Value::Global(Global::Int),
+            _ => Value::Global(Global::Other),
+        };
+        Ok(value)
+    }
+
+    // Handle the REDUCE opcode for the few Global objects we support.
+    fn reduce_global(&mut self, global: Value, mut argtuple: Vec<Value>) -> Result<()> {
+        match global {
+            Value::Global(Global::Set) => match self.resolve(argtuple.pop()) {
+                Some(Value::List(items)) => {
+                    self.stack
+                        .push(Value::Set(HashSetWrapper(items.into_iter().collect())));
+                    Ok(())
+                }
+                _ => self.error(ErrorCode::InvalidValue("set() arg".into())),
+            },
+            Value::Global(Global::Frozenset) => match self.resolve(argtuple.pop()) {
+                Some(Value::List(items)) => {
+                    self.stack.push(Value::FrozenSet(HashSetWrapper(
+                        items.into_iter().collect(),
+                    )));
+                    Ok(())
+                }
+                _ => self.error(ErrorCode::InvalidValue("frozenset() arg".into())),
+            },
+            Value::Global(Global::Bytearray) => {
+                // On Py2, the call is encoded as bytearray(u"foo", "latin-1").
+                argtuple.truncate(1);
+                match self.resolve(argtuple.pop()) {
+                    Some(Value::Bytes(bytes)) => {
+                        self.stack.push(Value::Bytes(bytes));
+                        Ok(())
+                    }
+                    Some(Value::String(string)) => {
+                        // The code points in the string are actually bytes values.
+                        // So we need to collect them individually.
+                        self.stack.push(Value::Bytes(
+                            string.chars().map(|ch| ch as u32 as u8).collect(),
+                        ));
+                        Ok(())
+                    }
+                    _ => self.error(ErrorCode::InvalidValue("bytearray() arg".into())),
+                }
+            }
+            Value::Global(Global::List) => match self.resolve(argtuple.pop()) {
+                Some(Value::List(items)) => {
+                    self.stack.push(Value::List(items));
+                    Ok(())
+                }
+                _ => self.error(ErrorCode::InvalidValue("list() arg".into())),
+            },
+            Value::Global(Global::Int) => match self.resolve(argtuple.pop()) {
+                Some(Value::Int(integer)) => {
+                    self.stack.push(Value::Int(integer));
+                    Ok(())
+                }
+                _ => self.error(ErrorCode::InvalidValue("int() arg".into())),
+            },
+            Value::Global(Global::Encode) => {
+                // Byte object encoded as _codecs.encode(x, 'latin1')
+                match self.resolve(argtuple.pop()) {
+                    // Encoding, always latin1
+                    Some(Value::String(_)) => {}
+                    _ => return self.error(ErrorCode::InvalidValue("encode() arg".into())),
+                }
+                match self.resolve(argtuple.pop()) {
+                    Some(Value::String(s)) => {
+                        // Now we have to convert the string to latin-1
+                        // encoded bytes.  It never contains codepoints
+                        // above 0xff.
+                        let bytes = s.chars().map(|ch| ch as u8).collect();
+                        self.stack.push(Value::Bytes(bytes));
+                        Ok(())
+                    }
+                    _ => self.error(ErrorCode::InvalidValue("encode() arg".into())),
+                }
+            }
+            Value::Global(Global::Other) => {
+                // Anything else; just keep it on the stack as an opaque object.
+                // If it is a class object, it will get replaced later when the
+                // class is instantiated.
+                self.stack.push(Value::Global(Global::Other));
+                Ok(())
+            }
+            other => Self::stack_error("global reference", &other, self.pos),
+        }
+    }
+
+    fn convert_value(&mut self, value: Value) -> Result<Value> {
+        match value {
+            Value::Int(v) => {
+                if let Some(i) = v.to_i64() {
+                    Ok(Value::I64(i))
+                } else {
+                    Ok(Value::Int(v))
+                }
+            }
+            Value::List(v) => {
+                let new = v
+                    .into_iter()
+                    .map(|v| self.convert_value(v))
+                    .collect::<Result<_>>();
+                Ok(Value::List(new?))
+            }
+            Value::Tuple(v) => {
+                let new = v
+                    .into_iter()
+                    .map(|v| self.convert_value(v))
+                    .collect::<Result<_>>();
+                Ok(Value::Tuple(new?))
+            }
+            Value::Set(v) => {
+                let new =
+                    v.0.into_iter()
+                        .map(|v| self.convert_value(v))
+                        .collect::<Result<_>>();
+                Ok(Value::Set(HashSetWrapper(new?)))
+            }
+            Value::FrozenSet(v) => {
+                let new =
+                    v.0.into_iter()
+                        .map(|v| self.convert_value(v))
+                        .collect::<Result<_>>();
+                Ok(Value::FrozenSet(HashSetWrapper(new?)))
+            }
+            Value::Dict(v) => {
+                let mut map = HashMap::new();
+                for (key, value) in v.0 {
+                    let real_key = self.convert_value(key)?;
+                    let real_value = self.convert_value(value)?;
+                    map.insert(real_key, real_value);
+                }
+                Ok(Value::Dict(HashMapWrapper(map)))
+            }
+            Value::MemoRef(memo_id) => {
+                self.resolve_recursive(memo_id, (), |slf, (), value| slf.convert_value(value))
+            }
+            _ => Ok(value),
+        }
+    }
+
+    fn stack_error<T>(what: &'static str, value: &Value, pos: usize) -> Result<T> {
+        let it = format!("{:?}", value);
+        Err(Error::Eval(ErrorCode::InvalidStackTop(what, it), pos))
+    }
+
     fn error<T>(&self, reason: ErrorCode) -> Result<T> {
-        Err(Error::Eval(reason, 0))
+        Err(Error::Eval(reason, self.pos))
     }
 }
-
-// class _Unpickler:
-
-//     def __init__(self, file, *, fix_imports=True,
-//                  encoding="ASCII", errors="strict", buffers=None):
-//         """This takes a binary file for reading a pickle data stream.
-
-//         The protocol version of the pickle is detected automatically, so
-//         no proto argument is needed.
-
-//         The argument *file* must have two methods, a read() method that
-//         takes an integer argument, and a readline() method that requires
-//         no arguments.  Both methods should return bytes.  Thus *file*
-//         can be a binary file object opened for reading, an io.BytesIO
-//         object, or any other custom object that meets this interface.
-
-//         The file-like object must have two methods, a read() method
-//         that takes an integer argument, and a readline() method that
-//         requires no arguments.  Both methods should return bytes.
-//         Thus file-like object can be a binary file object opened for
-//         reading, a BytesIO object, or any other custom object that
-//         meets this interface.
-
-//         If *buffers* is not None, it should be an iterable of buffer-enabled
-//         objects that is consumed each time the pickle stream references
-//         an out-of-band buffer view.  Such buffers have been given in order
-//         to the *buffer_callback* of a Pickler object.
-
-//         If *buffers* is None (the default), then the buffers are taken
-//         from the pickle stream, assuming they are serialized there.
-//         It is an error for *buffers* to be None if the pickle stream
-//         was produced with a non-None *buffer_callback*.
-
-//         Other optional arguments are *fix_imports*, *encoding* and
-//         *errors*, which are used to control compatibility support for
-//         pickle stream generated by Python 2.  If *fix_imports* is True,
-//         pickle will try to map the old Python 2 names to the new names
-//         used in Python 3.  The *encoding* and *errors* tell pickle how
-//         to decode 8-bit string instances pickled by Python 2; these
-//         default to 'ASCII' and 'strict', respectively. *encoding* can be
-//         'bytes' to read these 8-bit string instances as bytes objects.
-//         """
-//         self._buffers = iter(buffers) if buffers is not None else None
-//         self._file_readline = file.readline
-//         self._file_read = file.read
-//         self.memo = {}
-//         self.encoding = encoding
-//         self.errors = errors
-//         self.proto = 0
-//         self.fix_imports = fix_imports
-
-//     def load(self):
-//         """Read a pickled object representation from the open file.
-
-//         Return the reconstituted object hierarchy specified in the file.
-//         """
-//         # Check whether Unpickler was initialized correctly. This is
-//         # only needed to mimic the behavior of _pickle.Unpickler.dump().
-//         if not hasattr(self, "_file_read"):
-//             raise UnpicklingError("Unpickler.__init__() was not called by "
-//                                   "%s.__init__()" % (self.__class__.__name__,))
-//         self._unframer = _Unframer(self._file_read, self._file_readline)
-//         self.read = self._unframer.read
-//         self.readinto = self._unframer.readinto
-//         self.readline = self._unframer.readline
-//         self.metastack = []
-//         self.stack = []
-//         self.append = self.stack.append
-//         self.proto = 0
-//         read = self.read
-//         dispatch = self.dispatch
-//         try:
-//             while True:
-//                 key = read(1)
-//                 if not key:
-//                     raise EOFError
-//                 assert isinstance(key, bytes_types)
-//                 dispatch[key[0]](self)
-//         except _Stop as stopinst:
-//             return stopinst.value
-
-//     # Return a list of items pushed in the stack after last MARK instruction.
-//     def pop_mark(self):
-//         items = self.stack
-//         self.stack = self.metastack.pop()
-//         self.append = self.stack.append
-//         return items
-
-//     def persistent_load(self, pid):
-//         raise UnpicklingError("unsupported persistent id encountered")
-
-//     dispatch = {}
-
-//     def load_proto(self):
-//         proto = self.read(1)[0]
-//         if not 0 <= proto <= HIGHEST_PROTOCOL:
-//             raise ValueError("unsupported pickle protocol: %d" % proto)
-//         self.proto = proto
-//     dispatch[PROTO[0]] = load_proto
-
-//     def load_frame(self):
-//         frame_size, = unpack('<Q', self.read(8))
-//         if frame_size > sys.maxsize:
-//             raise ValueError("frame size > sys.maxsize: %d" % frame_size)
-//         self._unframer.load_frame(frame_size)
-//     dispatch[FRAME[0]] = load_frame
-
-//     def load_persid(self):
-//         try:
-//             pid = self.readline()[:-1].decode("ascii")
-//         except UnicodeDecodeError:
-//             raise UnpicklingError(
-//                 "persistent IDs in protocol 0 must be ASCII strings")
-//         self.append(self.persistent_load(pid))
-//     dispatch[PERSID[0]] = load_persid
-
-//     def load_binpersid(self):
-//         pid = self.stack.pop()
-//         self.append(self.persistent_load(pid))
-//     dispatch[BINPERSID[0]] = load_binpersid
-
-//     def load_none(self):
-//         self.append(None)
-//     dispatch[NONE[0]] = load_none
-
-//     def load_false(self):
-//         self.append(False)
-//     dispatch[NEWFALSE[0]] = load_false
-
-//     def load_true(self):
-//         self.append(True)
-//     dispatch[NEWTRUE[0]] = load_true
-
-//     def load_int(self):
-//         data = self.readline()
-//         if data == FALSE[1:]:
-//             val = False
-//         elif data == TRUE[1:]:
-//             val = True
-//         else:
-//             val = int(data, 0)
-//         self.append(val)
-//     dispatch[INT[0]] = load_int
-
-//     def load_binint(self):
-//         self.append(unpack('<i', self.read(4))[0])
-//     dispatch[BININT[0]] = load_binint
-
-//     def load_binint1(self):
-//         self.append(self.read(1)[0])
-//     dispatch[BININT1[0]] = load_binint1
-
-//     def load_binint2(self):
-//         self.append(unpack('<H', self.read(2))[0])
-//     dispatch[BININT2[0]] = load_binint2
-
-//     def load_long(self):
-//         val = self.readline()[:-1]
-//         if val and val[-1] == b'L'[0]:
-//             val = val[:-1]
-//         self.append(int(val, 0))
-//     dispatch[LONG[0]] = load_long
-
-//     def load_long1(self):
-//         n = self.read(1)[0]
-//         data = self.read(n)
-//         self.append(decode_long(data))
-//     dispatch[LONG1[0]] = load_long1
-
-//     def load_long4(self):
-//         n, = unpack('<i', self.read(4))
-//         if n < 0:
-//             # Corrupt or hostile pickle -- we never write one like this
-//             raise UnpicklingError("LONG pickle has negative byte count")
-//         data = self.read(n)
-//         self.append(decode_long(data))
-//     dispatch[LONG4[0]] = load_long4
-
-//     def load_float(self):
-//         self.append(float(self.readline()[:-1]))
-//     dispatch[FLOAT[0]] = load_float
-
-//     def load_binfloat(self):
-//         self.append(unpack('>d', self.read(8))[0])
-//     dispatch[BINFLOAT[0]] = load_binfloat
-
-//     def _decode_string(self, value):
-//         # Used to allow strings from Python 2 to be decoded either as
-//         # bytes or Unicode strings.  This should be used only with the
-//         # STRING, BINSTRING and SHORT_BINSTRING opcodes.
-//         if self.encoding == "bytes":
-//             return value
-//         else:
-//             return value.decode(self.encoding, self.errors)
-
-//     def load_string(self):
-//         data = self.readline()[:-1]
-//         # Strip outermost quotes
-//         if len(data) >= 2 and data[0] == data[-1] and data[0] in b'"\'':
-//             data = data[1:-1]
-//         else:
-//             raise UnpicklingError("the STRING opcode argument must be quoted")
-//         self.append(self._decode_string(codecs.escape_decode(data)[0]))
-//     dispatch[STRING[0]] = load_string
-
-//     def load_binstring(self):
-//         # Deprecated BINSTRING uses signed 32-bit length
-//         len, = unpack('<i', self.read(4))
-//         if len < 0:
-//             raise UnpicklingError("BINSTRING pickle has negative byte count")
-//         data = self.read(len)
-//         self.append(self._decode_string(data))
-//     dispatch[BINSTRING[0]] = load_binstring
-
-//     def load_binbytes(self):
-//         len, = unpack('<I', self.read(4))
-//         if len > maxsize:
-//             raise UnpicklingError("BINBYTES exceeds system's maximum size "
-//                                   "of %d bytes" % maxsize)
-//         self.append(self.read(len))
-//     dispatch[BINBYTES[0]] = load_binbytes
-
-//     def load_unicode(self):
-//         self.append(str(self.readline()[:-1], 'raw-unicode-escape'))
-//     dispatch[UNICODE[0]] = load_unicode
-
-//     def load_binunicode(self):
-//         len, = unpack('<I', self.read(4))
-//         if len > maxsize:
-//             raise UnpicklingError("BINUNICODE exceeds system's maximum size "
-//                                   "of %d bytes" % maxsize)
-//         self.append(str(self.read(len), 'utf-8', 'surrogatepass'))
-//     dispatch[BINUNICODE[0]] = load_binunicode
-
-//     def load_binunicode8(self):
-//         len, = unpack('<Q', self.read(8))
-//         if len > maxsize:
-//             raise UnpicklingError("BINUNICODE8 exceeds system's maximum size "
-//                                   "of %d bytes" % maxsize)
-//         self.append(str(self.read(len), 'utf-8', 'surrogatepass'))
-//     dispatch[BINUNICODE8[0]] = load_binunicode8
-
-//     def load_binbytes8(self):
-//         len, = unpack('<Q', self.read(8))
-//         if len > maxsize:
-//             raise UnpicklingError("BINBYTES8 exceeds system's maximum size "
-//                                   "of %d bytes" % maxsize)
-//         self.append(self.read(len))
-//     dispatch[BINBYTES8[0]] = load_binbytes8
-
-//     def load_bytearray8(self):
-//         len, = unpack('<Q', self.read(8))
-//         if len > maxsize:
-//             raise UnpicklingError("BYTEARRAY8 exceeds system's maximum size "
-//                                   "of %d bytes" % maxsize)
-//         b = bytearray(len)
-//         self.readinto(b)
-//         self.append(b)
-//     dispatch[BYTEARRAY8[0]] = load_bytearray8
-
-//     def load_next_buffer(self):
-//         if self._buffers is None:
-//             raise UnpicklingError("pickle stream refers to out-of-band data "
-//                                   "but no *buffers* argument was given")
-//         try:
-//             buf = next(self._buffers)
-//         except StopIteration:
-//             raise UnpicklingError("not enough out-of-band buffers")
-//         self.append(buf)
-//     dispatch[NEXT_BUFFER[0]] = load_next_buffer
-
-//     def load_readonly_buffer(self):
-//         buf = self.stack[-1]
-//         with memoryview(buf) as m:
-//             if not m.readonly:
-//                 self.stack[-1] = m.toreadonly()
-//     dispatch[READONLY_BUFFER[0]] = load_readonly_buffer
-
-//     def load_short_binstring(self):
-//         len = self.read(1)[0]
-//         data = self.read(len)
-//         self.append(self._decode_string(data))
-//     dispatch[SHORT_BINSTRING[0]] = load_short_binstring
-
-//     def load_short_binbytes(self):
-//         len = self.read(1)[0]
-//         self.append(self.read(len))
-//     dispatch[SHORT_BINBYTES[0]] = load_short_binbytes
-
-//     def load_short_binunicode(self):
-//         len = self.read(1)[0]
-//         self.append(str(self.read(len), 'utf-8', 'surrogatepass'))
-//     dispatch[SHORT_BINUNICODE[0]] = load_short_binunicode
-
-//     def load_tuple(self):
-//         items = self.pop_mark()
-//         self.append(tuple(items))
-//     dispatch[TUPLE[0]] = load_tuple
-
-//     def load_empty_tuple(self):
-//         self.append(())
-//     dispatch[EMPTY_TUPLE[0]] = load_empty_tuple
-
-//     def load_tuple1(self):
-//         self.stack[-1] = (self.stack[-1],)
-//     dispatch[TUPLE1[0]] = load_tuple1
-
-//     def load_tuple2(self):
-//         self.stack[-2:] = [(self.stack[-2], self.stack[-1])]
-//     dispatch[TUPLE2[0]] = load_tuple2
-
-//     def load_tuple3(self):
-//         self.stack[-3:] = [(self.stack[-3], self.stack[-2], self.stack[-1])]
-//     dispatch[TUPLE3[0]] = load_tuple3
-
-//     def load_empty_list(self):
-//         self.append([])
-//     dispatch[EMPTY_LIST[0]] = load_empty_list
-
-//     def load_empty_dictionary(self):
-//         self.append({})
-//     dispatch[EMPTY_DICT[0]] = load_empty_dictionary
-
-//     def load_empty_set(self):
-//         self.append(set())
-//     dispatch[EMPTY_SET[0]] = load_empty_set
-
-//     def load_frozenset(self):
-//         items = self.pop_mark()
-//         self.append(frozenset(items))
-//     dispatch[FROZENSET[0]] = load_frozenset
-
-//     def load_list(self):
-//         items = self.pop_mark()
-//         self.append(items)
-//     dispatch[LIST[0]] = load_list
-
-//     def load_dict(self):
-//         items = self.pop_mark()
-//         d = {items[i]: items[i+1]
-//              for i in range(0, len(items), 2)}
-//         self.append(d)
-//     dispatch[DICT[0]] = load_dict
-
-//     # INST and OBJ differ only in how they get a class object.  It's not
-//     # only sensible to do the rest in a common routine, the two routines
-//     # previously diverged and grew different bugs.
-//     # klass is the class to instantiate, and k points to the topmost mark
-//     # object, following which are the arguments for klass.__init__.
-//     def _instantiate(self, klass, args):
-//         if (args or not isinstance(klass, type) or
-//             hasattr(klass, "__getinitargs__")):
-//             try:
-//                 value = klass(*args)
-//             except TypeError as err:
-//                 raise TypeError("in constructor for %s: %s" %
-//                                 (klass.__name__, str(err)), err.__traceback__)
-//         else:
-//             value = klass.__new__(klass)
-//         self.append(value)
-
-//     def load_inst(self):
-//         module = self.readline()[:-1].decode("ascii")
-//         name = self.readline()[:-1].decode("ascii")
-//         klass = self.find_class(module, name)
-//         self._instantiate(klass, self.pop_mark())
-//     dispatch[INST[0]] = load_inst
-
-//     def load_obj(self):
-//         # Stack is ... markobject classobject arg1 arg2 ...
-//         args = self.pop_mark()
-//         cls = args.pop(0)
-//         self._instantiate(cls, args)
-//     dispatch[OBJ[0]] = load_obj
-
-//     def load_newobj(self):
-//         args = self.stack.pop()
-//         cls = self.stack.pop()
-//         obj = cls.__new__(cls, *args)
-//         self.append(obj)
-//     dispatch[NEWOBJ[0]] = load_newobj
-
-//     def load_newobj_ex(self):
-//         kwargs = self.stack.pop()
-//         args = self.stack.pop()
-//         cls = self.stack.pop()
-//         obj = cls.__new__(cls, *args, **kwargs)
-//         self.append(obj)
-//     dispatch[NEWOBJ_EX[0]] = load_newobj_ex
-
-//     def load_global(self):
-//         module = self.readline()[:-1].decode("utf-8")
-//         name = self.readline()[:-1].decode("utf-8")
-//         klass = self.find_class(module, name)
-//         self.append(klass)
-//     dispatch[GLOBAL[0]] = load_global
-
-//     def load_stack_global(self):
-//         name = self.stack.pop()
-//         module = self.stack.pop()
-//         if type(name) is not str or type(module) is not str:
-//             raise UnpicklingError("STACK_GLOBAL requires str")
-//         self.append(self.find_class(module, name))
-//     dispatch[STACK_GLOBAL[0]] = load_stack_global
-
-//     def load_ext1(self):
-//         code = self.read(1)[0]
-//         self.get_extension(code)
-//     dispatch[EXT1[0]] = load_ext1
-
-//     def load_ext2(self):
-//         code, = unpack('<H', self.read(2))
-//         self.get_extension(code)
-//     dispatch[EXT2[0]] = load_ext2
-
-//     def load_ext4(self):
-//         code, = unpack('<i', self.read(4))
-//         self.get_extension(code)
-//     dispatch[EXT4[0]] = load_ext4
-
-//     def get_extension(self, code):
-//         nil = []
-//         obj = _extension_cache.get(code, nil)
-//         if obj is not nil:
-//             self.append(obj)
-//             return
-//         key = _inverted_registry.get(code)
-//         if not key:
-//             if code <= 0: # note that 0 is forbidden
-//                 # Corrupt or hostile pickle.
-//                 raise UnpicklingError("EXT specifies code <= 0")
-//             raise ValueError("unregistered extension code %d" % code)
-//         obj = self.find_class(*key)
-//         _extension_cache[code] = obj
-//         self.append(obj)
-
-//     def find_class(self, module, name):
-//         # Subclasses may override this.
-//         sys.audit('pickle.find_class', module, name)
-//         if self.proto < 3 and self.fix_imports:
-//             if (module, name) in _compat_pickle.NAME_MAPPING:
-//                 module, name = _compat_pickle.NAME_MAPPING[(module, name)]
-//             elif module in _compat_pickle.IMPORT_MAPPING:
-//                 module = _compat_pickle.IMPORT_MAPPING[module]
-//         __import__(module, level=0)
-//         if self.proto >= 4:
-//             return _getattribute(sys.modules[module], name)[0]
-//         else:
-//             return getattr(sys.modules[module], name)
-
-//     def load_reduce(self):
-//         stack = self.stack
-//         args = stack.pop()
-//         func = stack[-1]
-//         stack[-1] = func(*args)
-//     dispatch[REDUCE[0]] = load_reduce
-
-//     def load_pop(self):
-//         if self.stack:
-//             del self.stack[-1]
-//         else:
-//             self.pop_mark()
-//     dispatch[POP[0]] = load_pop
-
-//     def load_pop_mark(self):
-//         self.pop_mark()
-//     dispatch[POP_MARK[0]] = load_pop_mark
-
-//     def load_dup(self):
-//         self.append(self.stack[-1])
-//     dispatch[DUP[0]] = load_dup
-
-//     def load_get(self):
-//         i = int(self.readline()[:-1])
-//         try:
-//             self.append(self.memo[i])
-//         except KeyError:
-//             msg = f'Memo value not found at index {i}'
-//             raise UnpicklingError(msg) from None
-//     dispatch[GET[0]] = load_get
-
-//     def load_binget(self):
-//         i = self.read(1)[0]
-//         try:
-//             self.append(self.memo[i])
-//         except KeyError as exc:
-//             msg = f'Memo value not found at index {i}'
-//             raise UnpicklingError(msg) from None
-//     dispatch[BINGET[0]] = load_binget
-
-//     def load_long_binget(self):
-//         i, = unpack('<I', self.read(4))
-//         try:
-//             self.append(self.memo[i])
-//         except KeyError as exc:
-//             msg = f'Memo value not found at index {i}'
-//             raise UnpicklingError(msg) from None
-//     dispatch[LONG_BINGET[0]] = load_long_binget
-
-//     def load_put(self):
-//         i = int(self.readline()[:-1])
-//         if i < 0:
-//             raise ValueError("negative PUT argument")
-//         self.memo[i] = self.stack[-1]
-//     dispatch[PUT[0]] = load_put
-
-//     def load_binput(self):
-//         i = self.read(1)[0]
-//         if i < 0:
-//             raise ValueError("negative BINPUT argument")
-//         self.memo[i] = self.stack[-1]
-//     dispatch[BINPUT[0]] = load_binput
-
-//     def load_long_binput(self):
-//         i, = unpack('<I', self.read(4))
-//         if i > maxsize:
-//             raise ValueError("negative LONG_BINPUT argument")
-//         self.memo[i] = self.stack[-1]
-//     dispatch[LONG_BINPUT[0]] = load_long_binput
-
-//     def load_memoize(self):
-//         memo = self.memo
-//         memo[len(memo)] = self.stack[-1]
-//     dispatch[MEMOIZE[0]] = load_memoize
-
-//     def load_append(self):
-//         stack = self.stack
-//         value = stack.pop()
-//         list = stack[-1]
-//         list.append(value)
-//     dispatch[APPEND[0]] = load_append
-
-//     def load_appends(self):
-//         items = self.pop_mark()
-//         list_obj = self.stack[-1]
-//         try:
-//             extend = list_obj.extend
-//         except AttributeError:
-//             pass
-//         else:
-//             extend(items)
-//             return
-//         # Even if the PEP 307 requires extend() and append() methods,
-//         # fall back on append() if the object has no extend() method
-//         # for backward compatibility.
-//         append = list_obj.append
-//         for item in items:
-//             append(item)
-//     dispatch[APPENDS[0]] = load_appends
-
-//     def load_setitem(self):
-//         stack = self.stack
-//         value = stack.pop()
-//         key = stack.pop()
-//         dict = stack[-1]
-//         dict[key] = value
-//     dispatch[SETITEM[0]] = load_setitem
-
-//     def load_setitems(self):
-//         items = self.pop_mark()
-//         dict = self.stack[-1]
-//         for i in range(0, len(items), 2):
-//             dict[items[i]] = items[i + 1]
-//     dispatch[SETITEMS[0]] = load_setitems
-
-//     def load_additems(self):
-//         items = self.pop_mark()
-//         set_obj = self.stack[-1]
-//         if isinstance(set_obj, set):
-//             set_obj.update(items)
-//         else:
-//             add = set_obj.add
-//             for item in items:
-//                 add(item)
-//     dispatch[ADDITEMS[0]] = load_additems
-
-//     def load_build(self):
-//         stack = self.stack
-//         state = stack.pop()
-//         inst = stack[-1]
-//         setstate = getattr(inst, "__setstate__", _NoValue)
-//         if setstate is not _NoValue:
-//             setstate(state)
-//             return
-//         slotstate = None
-//         if isinstance(state, tuple) and len(state) == 2:
-//             state, slotstate = state
-//         if state:
-//             inst_dict = inst.__dict__
-//             intern = sys.intern
-//             for k, v in state.items():
-//                 if type(k) is str:
-//                     inst_dict[intern(k)] = v
-//                 else:
-//                     inst_dict[k] = v
-//         if slotstate:
-//             for k, v in slotstate.items():
-//                 setattr(inst, k, v)
-//     dispatch[BUILD[0]] = load_build
-
-//     def load_mark(self):
-//         self.metastack.append(self.stack)
-//         self.stack = []
-//         self.append = self.stack.append
-//     dispatch[MARK[0]] = load_mark
-
-//     def load_stop(self):
-//         value = self.stack.pop()
-//         raise _Stop(value)
-//     dispatch[STOP[0]] = load_stop
-
-// # Shorthands
-
-// def _dump(obj, file, protocol=None, *, fix_imports=True, buffer_callback=None):
-//     _Pickler(file, protocol, fix_imports=fix_imports,
-//              buffer_callback=buffer_callback).dump(obj)
-
-// def _dumps(obj, protocol=None, *, fix_imports=True, buffer_callback=None):
-//     f = io.BytesIO()
-//     _Pickler(f, protocol, fix_imports=fix_imports,
-//              buffer_callback=buffer_callback).dump(obj)
-//     res = f.getvalue()
-//     assert isinstance(res, bytes_types)
-//     return res
-
-// def _load(file, *, fix_imports=True, encoding="ASCII", errors="strict",
-//           buffers=None):
-//     return _Unpickler(file, fix_imports=fix_imports, buffers=buffers,
-//                      encoding=encoding, errors=errors).load()
-
-// def _loads(s, /, *, fix_imports=True, encoding="ASCII", errors="strict",
-//            buffers=None):
-//     if isinstance(s, str):
-//         raise TypeError("Can't load pickle from unicode string")
-//     file = io.BytesIO(s)
-//     return _Unpickler(file, fix_imports=fix_imports, buffers=buffers,
-//                       encoding=encoding, errors=errors).load()
-
-// # Use the faster _pickle if possible
-// try:
-//     from _pickle import (
-//         PickleError,
-//         PicklingError,
-//         UnpicklingError,
-//         Pickler,
-//         Unpickler,
-//         dump,
-//         dumps,
-//         load,
-//         loads
-//     )
-// except ImportError:
-//     Pickler, Unpickler = _Pickler, _Unpickler
-//     dump, dumps, load, loads = _dump, _dumps, _load, _loads
-
-// # Doctest
-// def _test():
-//     import doctest
-//     return doctest.testmod()
-
-// if __name__ == "__main__":
-//     import argparse
-//     parser = argparse.ArgumentParser(
-//         description='display contents of the pickle files')
-//     parser.add_argument(
-//         'pickle_file', type=argparse.FileType('br'),
-//         nargs='*', help='the pickle file')
-//     parser.add_argument(
-//         '-t', '--test', action='store_true',
-//         help='run self-test suite')
-//     parser.add_argument(
-//         '-v', action='store_true',
-//         help='run verbosely; only affects self-test run')
-//     args = parser.parse_args()
-//     if args.test:
-//         _test()
-//     else:
-//         if not args.pickle_file:
-//             parser.print_help()
-//         else:
-//             import pprint
-//             for f in args.pickle_file:
-//                 obj = load(f)
-//                 pprint.pprint(obj)

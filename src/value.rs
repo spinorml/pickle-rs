@@ -20,6 +20,8 @@
 
 use std::hash::Hash;
 
+use num_bigint::BigInt;
+
 use crate::{F64Wrapper, HashMapWrapper, HashSetWrapper};
 
 pub type MemoId = u32;
@@ -41,9 +43,8 @@ pub enum Value {
     Global(Global),
     None,
     Bool(bool),
-    Int(i32),
+    Int(BigInt),
     I64(i64),
-    I128(i128),
     F64(F64Wrapper),
     Bytes(Vec<u8>),
     String(String),
@@ -54,8 +55,12 @@ pub enum Value {
     Dict(HashMapWrapper<Value, Value>),
     PersId(String),
     BinPersId(Box<Value>),
-    Class(String, String),
-    Reduce(Box<Value>, Box<Value>),
 }
 
 impl std::cmp::Eq for Value {}
+
+impl From<i128> for Value {
+    fn from(i: i128) -> Self {
+        Value::Int(BigInt::from(i))
+    }
+}
